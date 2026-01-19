@@ -1,0 +1,119 @@
+{
+  "membership_types": {
+    "year_paid_in_full": {
+      "name": "Year Paid in Full",
+      "description": "Annual memberships paid upfront",
+      "rules": {
+        "date_diff_min_days": 365,
+        "date_diff_max_days": 366,
+        "min_dues_amount": 600,
+        "expected_pay_type": "ANNUAL BILL",
+        "expected_end_draft": "12/31/99",
+        "expected_cycle": 1
+      },
+      "enabled": true
+    },
+    "default": {
+      "name": "Default (Year Paid in Full Rules)",
+      "description": "Default rules applied when membership type is not specified",
+      "rules": {
+        "date_diff_min_days": 365,
+        "date_diff_max_days": 366,
+        "min_dues_amount": 600,
+        "expected_pay_type": "ANNUAL BILL",
+        "expected_end_draft": "12/31/99",
+        "expected_cycle": 1
+      },
+      "enabled": true
+    }
+  },
+  "future_types": {
+    "monthly": {
+      "name": "Monthly Membership",
+      "description": "Month-to-month recurring membership",
+      "rules": {
+        "date_diff_min_days": null,
+        "date_diff_max_days": null,
+        "min_dues_amount": null,
+        "expected_pay_type": null,
+        "expected_end_draft": null,
+        "expected_cycle": null
+      },
+      "enabled": false,
+      "notes": "Rules to be defined - use AskUserQuestion tool to determine criteria"
+    },
+    "quarterly": {
+      "name": "Quarterly Membership",
+      "description": "3-month prepaid membership",
+      "rules": {
+        "date_diff_min_days": null,
+        "date_diff_max_days": null,
+        "min_dues_amount": null,
+        "expected_pay_type": null,
+        "expected_end_draft": null,
+        "expected_cycle": null
+      },
+      "enabled": false,
+      "notes": "Rules to be defined - use AskUserQuestion tool to determine criteria"
+    },
+    "student": {
+      "name": "Student Membership",
+      "description": "Discounted membership for students",
+      "rules": {
+        "date_diff_min_days": null,
+        "date_diff_max_days": null,
+        "min_dues_amount": null,
+        "expected_pay_type": null,
+        "expected_end_draft": null,
+        "expected_cycle": null
+      },
+      "enabled": false,
+      "notes": "Rules to be defined - use AskUserQuestion tool to determine criteria"
+    },
+    "family": {
+      "name": "Family/Couple Membership",
+      "description": "Multi-person membership package",
+      "rules": {
+        "date_diff_min_days": null,
+        "date_diff_max_days": null,
+        "min_dues_amount": null,
+        "expected_pay_type": null,
+        "expected_end_draft": null,
+        "expected_cycle": null
+      },
+      "enabled": false,
+      "notes": "Rules to be defined - use AskUserQuestion tool to determine criteria"
+    },
+    "corporate": {
+      "name": "Corporate Membership",
+      "description": "Company-sponsored memberships",
+      "rules": {
+        "date_diff_min_days": null,
+        "date_diff_max_days": null,
+        "min_dues_amount": null,
+        "expected_pay_type": null,
+        "expected_end_draft": null,
+        "expected_cycle": null
+      },
+      "enabled": false,
+      "notes": "Rules to be defined - use AskUserQuestion tool to determine criteria"
+    },
+    "day_pass": {
+      "name": "Day Pass / Drop-in",
+      "description": "Single day access",
+      "rules": {
+        "date_diff_min_days": null,
+        "date_diff_max_days": null,
+        "min_dues_amount": null,
+        "expected_pay_type": null,
+        "expected_end_draft": null,
+        "expected_cycle": null
+      },
+      "enabled": false,
+      "notes": "Rules to be defined - use AskUserQuestion tool to determine criteria"
+    }
+  },
+  "version": "1.0.0",
+  "last_updated": "2026-01-18",
+  "notes": "Current version only supports Year Paid in Full rules. Future membership types need rule definition."
+}

@@ -1,0 +1,42 @@
+{
+  "app": {
+    "title": "Gym Membership Audit Tool",
+    "version": "1.0.0",
+    "description": "Automated membership data audit with red flag detection"
+  },
+  "paths": {
+    "output_folder": "outputs",
+    "config_folder": "config"
+  },
+  "audit": {
+    "default_membership_type": "year_paid_in_full",
+    "generate_individual_reports": true,
+    "generate_consolidated_report": true,
+    "include_summary_sheet": true
+  },
+  "display": {
+    "max_member_ids_display": 50,
+    "chart_height": 400,
+    "table_page_size": 25
+  },
+  "server": {
+    "host": "localhost",
+    "port": 8501,
+    "auto_open_browser": true
+  },
+  "theme": {
+    "primary_color": "#FF6B6B",
+    "background_color": "#FFFFFF",
+    "secondary_background_color": "#F0F2F6",
+    "text_color": "#262730",
+    "success_color": "#28a745",
+    "warning_color": "#ffc107",
+    "error_color": "#dc3545"
+  },
+  "advanced": {
+    "enable_debug_mode": false,
+    "log_level": "INFO",
+    "max_file_size_mb": 50
+  },
+  "notes": "Configuration file for Gym Audit Tool. Modify as needed for your environment."
+}

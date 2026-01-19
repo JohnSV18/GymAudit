@@ -1,0 +1,16 @@
+# Gym Membership Audit Tool - Python Dependencies
+
+# Core dependencies
+streamlit>=1.31.0
+pandas>=2.0.0
+openpyxl>=3.1.0
+
+# Data visualization
+plotly>=5.18.0
+
+# Additional utilities
+python-dateutil>=2.8.2
+
+# Optional (for future enhancements)
+# xlrd>=2.0.1  # For reading older .xls files
+# numpy>=1.24.0  # For advanced statistical analysis
