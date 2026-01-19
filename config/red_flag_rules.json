@@ -1,119 +1,104 @@
 {
+  "locations": {
+    "bqe": {
+      "name": "BQE",
+      "display_name": "BQE"
+    },
+    "greenpoint": {
+      "name": "Greenpoint",
+      "display_name": "Greenpoint"
+    },
+    "lic": {
+      "name": "LIC",
+      "display_name": "LIC (Long Island City)"
+    }
+  },
   "membership_types": {
-    "year_paid_in_full": {
-      "name": "Year Paid in Full",
-      "description": "Annual memberships paid upfront",
+    "1_year_paid_in_full": {
+      "name": "1 Year Paid in Full",
+      "description": "Annual membership paid upfront",
+      "pricing": {
+        "bqe": 725,
+        "greenpoint": 1085,
+        "lic": 1500
+      },
       "rules": {
-        "date_diff_min_days": 365,
         "date_diff_max_days": 366,
-        "min_dues_amount": 600,
-        "expected_pay_type": "ANNUAL BILL",
-        "expected_end_draft": "12/31/99",
-        "expected_cycle": 1
+        "date_diff_min_days": 365,
+        "date_rule_type": "exact_range",
+        "payment_threshold_percent": 90,
+        "expected_cycle": 0,
+        "check_balance": true,
+        "expected_balance": 0,
+        "check_pay_type": false,
+        "check_end_draft": false
       },
       "enabled": true
     },
-    "default": {
-      "name": "Default (Year Paid in Full Rules)",
-      "description": "Default rules applied when membership type is not specified",
+    "3_months_paid_in_full": {
+      "name": "3 Months Paid in Full",
+      "description": "Quarterly membership paid upfront",
+      "pricing": {
+        "bqe": 440,
+        "greenpoint": 650,
+        "lic": 850
+      },
       "rules": {
-        "date_diff_min_days": 365,
-        "date_diff_max_days": 366,
-        "min_dues_amount": 600,
-        "expected_pay_type": "ANNUAL BILL",
-        "expected_end_draft": "12/31/99",
-        "expected_cycle": 1
+        "date_diff_max_days": 93,
+        "date_rule_type": "max_only",
+        "payment_threshold_percent": 90,
+        "cycle_max": 3,
+        "cycle_rule_type": "max",
+        "check_balance": true,
+        "expected_balance": 0,
+        "check_pay_type": false,
+        "check_end_draft": false
       },
       "enabled": true
+    },
+    "1_month_paid_in_full": {
+      "name": "1 Month Paid in Full",
+      "description": "Monthly membership paid upfront",
+      "pricing": {
+        "bqe": 240,
+        "greenpoint": 350,
+        "lic": 450
+      },
+      "rules": {
+        "date_diff_max_days": 31,
+        "date_rule_type": "max_only",
+        "payment_threshold_percent": 90,
+        "expected_cycle": 0,
+        "check_balance": true,
+        "expected_balance": 0,
+        "check_pay_type": false,
+        "check_end_draft": false
+      },
+      "enabled": true
+    },
+    "month_to_month": {
+      "name": "Month to Month",
+      "description": "Recurring monthly membership",
+      "pricing": {
+        "bqe": null,
+        "greenpoint": null,
+        "lic": null
+      },
+      "rules": {
+        "expected_exp_year": 2099,
+        "expected_cycle": 1,
+        "draft_date_max_months_from_join": 3,
+        "expected_end_draft_year": 2099,
+        "min_monthly_fee": 59.99,
+        "check_balance": true,
+        "expected_balance": 0,
+        "check_pay_type": false
+      },
+      "enabled": true,
+      "notes": "Pricing TBD - will be updated later"
     }
   },
-  "future_types": {
-    "monthly": {
-      "name": "Monthly Membership",
-      "description": "Month-to-month recurring membership",
-      "rules": {
-        "date_diff_min_days": null,
-        "date_diff_max_days": null,
-        "min_dues_amount": null,
-        "expected_pay_type": null,
-        "expected_end_draft": null,
-        "expected_cycle": null
-      },
-      "enabled": false,
-      "notes": "Rules to be defined - use AskUserQuestion tool to determine criteria"
-    },
-    "quarterly": {
-      "name": "Quarterly Membership",
-      "description": "3-month prepaid membership",
-      "rules": {
-        "date_diff_min_days": null,
-        "date_diff_max_days": null,
-        "min_dues_amount": null,
-        "expected_pay_type": null,
-        "expected_end_draft": null,
-        "expected_cycle": null
-      },
-      "enabled": false,
-      "notes": "Rules to be defined - use AskUserQuestion tool to determine criteria"
-    },
-    "student": {
-      "name": "Student Membership",
-      "description": "Discounted membership for students",
-      "rules": {
-        "date_diff_min_days": null,
-        "date_diff_max_days": null,
-        "min_dues_amount": null,
-        "expected_pay_type": null,
-        "expected_end_draft": null,
-        "expected_cycle": null
-      },
-      "enabled": false,
-      "notes": "Rules to be defined - use AskUserQuestion tool to determine criteria"
-    },
-    "family": {
-      "name": "Family/Couple Membership",
-      "description": "Multi-person membership package",
-      "rules": {
-        "date_diff_min_days": null,
-        "date_diff_max_days": null,
-        "min_dues_amount": null,
-        "expected_pay_type": null,
-        "expected_end_draft": null,
-        "expected_cycle": null
-      },
-      "enabled": false,
-      "notes": "Rules to be defined - use AskUserQuestion tool to determine criteria"
-    },
-    "corporate": {
-      "name": "Corporate Membership",
-      "description": "Company-sponsored memberships",
-      "rules": {
-        "date_diff_min_days": null,
-        "date_diff_max_days": null,
-        "min_dues_amount": null,
-        "expected_pay_type": null,
-        "expected_end_draft": null,
-        "expected_cycle": null
-      },
-      "enabled": false,
-      "notes": "Rules to be defined - use AskUserQuestion tool to determine criteria"
-    },
-    "day_pass": {
-      "name": "Day Pass / Drop-in",
-      "description": "Single day access",
-      "rules": {
-        "date_diff_min_days": null,
-        "date_diff_max_days": null,
-        "min_dues_amount": null,
-        "expected_pay_type": null,
-        "expected_end_draft": null,
-        "expected_cycle": null
-      },
-      "enabled": false,
-      "notes": "Rules to be defined - use AskUserQuestion tool to determine criteria"
-    }
-  },
-  "version": "1.0.0",
-  "last_updated": "2026-01-18",
-  "notes": "Current version only supports Year Paid in Full rules. Future membership types need rule definition."
+  "version": "2.0.0",
+  "last_updated": "2026-01-19",
+  "notes": "Updated with multi-location pricing and multiple membership types"
 }

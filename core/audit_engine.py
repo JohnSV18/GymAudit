@@ -1,11 +1,12 @@
 """
 Audit Engine Module
 Orchestrates the membership data audit process
+Supports multiple membership types and locations
 """
 
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from pathlib import Path
-from .red_flags import RedFlagChecker
+from .red_flags import RedFlagChecker, create_checker
 from .file_handler import MembershipFileReader
 from .report_generator import AuditReportGenerator
 
@@ -15,17 +16,21 @@ class AuditEngine:
 
     def __init__(
         self,
-        red_flag_checker: RedFlagChecker,
+        membership_type: str,
+        location: str,
         output_folder: str = 'outputs'
     ):
         """
-        Initialize audit engine
+        Initialize audit engine with membership type and location
 
         Args:
-            red_flag_checker: Configured RedFlagChecker instance
+            membership_type: Key from config (e.g., '1_year_paid_in_full', '3_months_paid_in_full')
+            location: Key from config (e.g., 'bqe', 'greenpoint', 'lic')
             output_folder: Directory for output reports
         """
-        self.checker = red_flag_checker
+        self.membership_type = membership_type
+        self.location = location
+        self.checker = create_checker(membership_type, location)
         self.file_reader = MembershipFileReader()
         self.report_generator = AuditReportGenerator(output_folder)
 

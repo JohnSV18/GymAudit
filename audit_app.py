@@ -1,6 +1,7 @@
 """
 Gym Membership Audit Tool - Main Streamlit Application
 A frictionless tool for auditing gym membership data
+Supports multiple membership types and locations
 """
 
 import streamlit as st
@@ -10,7 +11,7 @@ from pathlib import Path
 import plotly.express as px
 import plotly.graph_objects as go
 
-from core.red_flags import create_default_checker
+from core.red_flags import get_locations, get_membership_types, load_config
 from core.audit_engine import AuditEngine
 from utils.statistics import AuditStatistics
 
@@ -34,13 +35,15 @@ def load_settings():
     return {}
 
 
-# Initialize audit engine
 @st.cache_resource
-def get_audit_engine():
-    """Create and cache audit engine instance"""
-    checker = create_default_checker()
-    engine = AuditEngine(checker, output_folder='outputs')
-    return engine
+def load_audit_config():
+    """Load the red flag configuration"""
+    return load_config()
+
+
+def get_audit_engine(membership_type: str, location: str):
+    """Create audit engine for the specified membership type and location"""
+    return AuditEngine(membership_type, location, output_folder='outputs')
 
 
 def format_currency(amount):
@@ -68,6 +71,7 @@ def main():
     """Main application"""
 
     settings = load_settings()
+    config = load_audit_config()
 
     # Header
     st.title("🏋️ Gym Membership Audit Tool")
@@ -94,14 +98,11 @@ def main():
 
         It includes:
         - **Missing Dues**: Money that should have been collected but wasn't
-          - Example: Member paid $0 but should have paid $600 → Impact = $600
+          - Example: Member paid $0 but should have paid the expected amount → Impact = expected amount
         - **Outstanding Balances**: Amounts owed (debits) or refunds due (credits)
           - Example: Member has $50 balance → Impact = $50
 
-        **Important:** Some accounts may contribute to BOTH categories. For instance:
-        - Paid $0 dues (should be $600) = +$600
-        - Has $50 balance = +$50
-        - Total for this account = $650
+        **Important:** Some accounts may contribute to BOTH categories.
 
         The Financial Impact is the sum of all these discrepancies. It represents potential revenue issues,
         not necessarily actual money owed.
@@ -110,14 +111,21 @@ def main():
 
         ### 🚨 What are Red Flags?
 
-        Red flags are data anomalies that indicate something might be wrong with an account:
+        Red flags are data anomalies that indicate something might be wrong with an account.
+        The specific checks depend on the membership type selected:
 
-        1. **Date Mismatch**: Join and Expiration dates aren't exactly 1 year apart (365-366 days)
-        2. **Low Dues**: Dues amount is less than $600
-        3. **Wrong Pay Type**: Pay Type doesn't say "Annual Bill"
-        4. **End Draft Error**: End Draft date isn't the standard 12/31/99
-        5. **Cycle Error**: Cycle number isn't 1
-        6. **Balance Issue**: Balance isn't exactly $0.00 (has credit or debit)
+        **Paid in Full Memberships (1 Year, 3 Month, 1 Month):**
+        - Date range validation based on membership length
+        - Dues amount must be at least 90% of expected price
+        - Cycle value must match expected (0 for PIF memberships)
+        - Balance must be $0.00
+
+        **Month to Month:**
+        - Expiration year should be 2099
+        - Cycle should be 1
+        - Draft date within 3 months of join date
+        - End draft year should be 2099
+        - Balance must be $0.00
 
         **Yellow rows in your Excel reports = accounts that need attention!**
         """)
@@ -130,19 +138,84 @@ def main():
         st.info(
             "This tool automatically audits gym membership spreadsheets and flags "
             "accounts with data anomalies.\n\n"
-            "**Upload your files, get instant results!**"
+            "**Select your location and membership type, then upload files!**"
         )
 
+        # Location and Membership Type Selection
+        st.header("Audit Settings")
+
+        # Get available options from config
+        locations = get_locations(config)
+        membership_types = get_membership_types(config)
+
+        # Location dropdown
+        location_keys = list(locations.keys())
+        location_labels = list(locations.values())
+        selected_location_idx = st.selectbox(
+            "Select Location",
+            range(len(location_keys)),
+            format_func=lambda x: location_labels[x],
+            help="Choose the gym location for this audit"
+        )
+        selected_location = location_keys[selected_location_idx]
+
+        # Membership type dropdown
+        type_keys = list(membership_types.keys())
+        type_labels = list(membership_types.values())
+        selected_type_idx = st.selectbox(
+            "Select Membership Type",
+            range(len(type_keys)),
+            format_func=lambda x: type_labels[x],
+            help="Choose the membership type to audit"
+        )
+        selected_membership_type = type_keys[selected_type_idx]
+
+        # Store selections in session state
+        st.session_state['selected_location'] = selected_location
+        st.session_state['selected_membership_type'] = selected_membership_type
+
+        st.markdown("---")
+
+        # Display current rules based on selection
         st.header("Red Flag Criteria")
-        st.markdown("""
-        **Current Rules (Year Paid in Full):**
-        - ⚠️ Join/Exp dates not 1 year apart
-        - ⚠️ Dues amount < $600
-        - ⚠️ Pay Type ≠ "Annual Bill"
-        - ⚠️ End Draft ≠ 12/31/99
-        - ⚠️ Cycle ≠ 1
-        - ⚠️ Balance ≠ $0.00
-        """)
+        type_config = config['membership_types'].get(selected_membership_type, {})
+        type_name = type_config.get('name', selected_membership_type)
+        pricing = type_config.get('pricing', {})
+        rules = type_config.get('rules', {})
+        expected_dues = pricing.get(selected_location, 0) or 0
+
+        st.markdown(f"**Rules for {type_name} at {locations[selected_location]}:**")
+
+        # Show relevant rules based on membership type
+        if rules.get('date_rule_type') == 'exact_range':
+            min_days = rules.get('date_diff_min_days', 365)
+            max_days = rules.get('date_diff_max_days', 366)
+            st.markdown(f"- ⚠️ Date range: {min_days}-{max_days} days")
+        elif rules.get('date_rule_type') == 'max_only':
+            max_days = rules.get('date_diff_max_days', 31)
+            st.markdown(f"- ⚠️ Max date range: {max_days} days")
+
+        if rules.get('expected_exp_year'):
+            st.markdown(f"- ⚠️ Exp year = {rules['expected_exp_year']}")
+
+        if expected_dues > 0:
+            threshold = rules.get('payment_threshold_percent', 90)
+            min_dues = expected_dues * (threshold / 100)
+            st.markdown(f"- ⚠️ Dues ≥ ${min_dues:.2f} ({threshold}% of ${expected_dues})")
+
+        if rules.get('cycle_rule_type') == 'exact' and rules.get('expected_cycle') is not None:
+            st.markdown(f"- ⚠️ Cycle = {rules['expected_cycle']}")
+        elif rules.get('cycle_rule_type') == 'max' and rules.get('cycle_max') is not None:
+            st.markdown(f"- ⚠️ Cycle ≤ {rules['cycle_max']}")
+
+        if rules.get('check_balance', True):
+            st.markdown(f"- ⚠️ Balance = ${rules.get('expected_balance', 0):.2f}")
+
+        if rules.get('draft_date_max_months_from_join'):
+            st.markdown(f"- ⚠️ Draft date within {rules['draft_date_max_months_from_join']} months of join")
+
+        if rules.get('expected_end_draft_year'):
+            st.markdown(f"- ⚠️ End draft year = {rules['expected_end_draft_year']}")
 
         st.markdown("---")
         st.caption(f"Version {settings.get('app', {}).get('version', '1.0.0')}")
@@ -153,6 +226,14 @@ def main():
     # TAB 1: Upload & Audit
     with tab1:
         st.header("Upload Membership Files")
+
+        # Show current selection
+        current_location = st.session_state.get('selected_location', 'bqe')
+        current_type = st.session_state.get('selected_membership_type', '1_year_paid_in_full')
+        location_name = locations.get(current_location, current_location)
+        type_name = membership_types.get(current_type, current_type)
+
+        st.info(f"**Auditing:** {type_name} memberships at **{location_name}**  \n*Change settings in the sidebar if needed.*")
 
         # File uploader
         uploaded_files = st.file_uploader(
@@ -184,16 +265,24 @@ def main():
                 progress_bar = st.progress(0)
                 status_text = st.empty()
 
-                # Get audit engine
-                engine = get_audit_engine()
+                # Get audit engine with current settings
+                engine = get_audit_engine(current_type, current_location)
 
                 # Process files
-                status_text.text("Processing files...")
+                status_text.text(f"Processing files for {type_name} at {location_name}...")
                 results = engine.audit_multiple_uploaded_files(
                     uploaded_files,
                     generate_individual_reports=True,
                     generate_consolidated=len(uploaded_files) > 1
                 )
+
+                # Store the settings used for this audit
+                results['audit_settings'] = {
+                    'location': current_location,
+                    'location_name': location_name,
+                    'membership_type': current_type,
+                    'membership_type_name': type_name
+                }
 
                 progress_bar.progress(100)
                 status_text.empty()
@@ -242,6 +331,11 @@ def main():
                 with st.expander("💡 **See Financial Impact Breakdown**", expanded=False):
                     st.markdown("### Where does the Financial Impact come from?")
 
+                    # Get audit settings
+                    audit_settings = results.get('audit_settings', {})
+                    audit_type_name = audit_settings.get('membership_type_name', 'the selected membership type')
+                    audit_location_name = audit_settings.get('location_name', 'the selected location')
+
                     total_dues = sum(r.get('total_dues_impact', 0) for r in results['file_results'] if r['success'])
                     total_balance = sum(r.get('total_balance_impact', 0) for r in results['file_results'] if r['success'])
 
@@ -251,7 +345,7 @@ def main():
                         st.metric(
                             "📉 Missing/Low Dues",
                             format_currency(total_dues),
-                            help="Accounts that paid less than the expected $600"
+                            help=f"Accounts that paid less than 90% of expected dues for {audit_type_name} at {audit_location_name}"
                         )
                         st.caption(f"{(total_dues / results['total_financial_impact'] * 100):.1f}% of total impact" if results['total_financial_impact'] > 0 else "")
 
@@ -265,7 +359,7 @@ def main():
 
                     st.info(
                         "**Note:** Some accounts may contribute to both categories. For example, "
-                        "an account with $0 dues AND a $50 balance would add $650 to the total impact. "
+                        "an account with $0 dues AND a $50 balance would add to both totals. "
                         "This represents data discrepancy value, not necessarily actual money owed."
                     )
 
@@ -355,10 +449,12 @@ def main():
 
             st.markdown("### How to Use")
             st.markdown("""
-            1. **Upload Files**: Click the file uploader above and select your CSV or Excel files
-            2. **Process**: Click the "Process Files" button
-            3. **Review Results**: See summary statistics and flagged member IDs
-            4. **Download Reports**: Get highlighted Excel reports with detailed notes
+            1. **Select Location**: Choose your gym location in the sidebar
+            2. **Select Membership Type**: Choose the membership type you're auditing
+            3. **Upload Files**: Click the file uploader above and select your CSV or Excel files
+            4. **Process**: Click the "Process Files" button
+            5. **Review Results**: See summary statistics and flagged member IDs
+            6. **Download Reports**: Get highlighted Excel reports with detailed notes
 
             **Supported Formats:** CSV, Excel (.xlsx, .xls)
             """)
@@ -529,11 +625,16 @@ def main():
                 total_dues = sum(r.get('dues_impact', 0) for r in all_audit_results)
                 total_balance = sum(r.get('balance_impact', 0) for r in all_audit_results)
 
+                # Get audit settings for dynamic info
+                audit_settings = results.get('audit_settings', {})
+                audit_type_name = audit_settings.get('membership_type_name', 'the selected membership type')
+                audit_location_name = audit_settings.get('location_name', 'the selected location')
+
                 # Info box explaining calculation
                 st.info(
                     "**How is Financial Impact calculated?**\n\n"
                     "The Financial Impact is the sum of:\n"
-                    "- **Missing/Low Dues**: Expected dues ($600) minus what was actually paid\n"
+                    f"- **Missing/Low Dues**: Expected dues for {audit_type_name} at {audit_location_name} minus what was actually paid (flagged if < 90%)\n"
                     "- **Outstanding Balances**: Absolute value of any non-zero balances\n\n"
                     "Some accounts may contribute to both categories."
                 )

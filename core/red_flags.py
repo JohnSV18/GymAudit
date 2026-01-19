@@ -1,10 +1,13 @@
 """
 Red Flag Detection Module
 Defines and checks for membership data anomalies
+Supports multiple membership types and locations
 """
 
+import json
 from datetime import datetime
-from typing import Dict, List, Any, Tuple
+from pathlib import Path
+from typing import Dict, List, Any, Tuple, Optional
 
 
 class RedFlag:
@@ -40,178 +43,259 @@ class RedFlagChecker:
     COL_MEMBERSHIP_LENGTH = 15
     COL_SALES_REP = 16
 
-    def __init__(self, rules: Dict[str, Any]):
+    def __init__(self, membership_type: str, location: str, config_path: str = None):
         """
-        Initialize with red flag rules
+        Initialize with membership type and location
 
         Args:
-            rules: Dictionary containing red flag criteria
+            membership_type: Key from config (e.g., '1_year_paid_in_full')
+            location: Key from config (e.g., 'bqe', 'greenpoint', 'lic')
+            config_path: Path to red_flag_rules.json (optional)
         """
-        self.rules = rules
+        self.membership_type = membership_type
+        self.location = location
+
+        # Load config
+        if config_path is None:
+            config_path = Path(__file__).parent.parent / 'config' / 'red_flag_rules.json'
+
+        with open(config_path, 'r') as f:
+            self.config = json.load(f)
+
+        # Get membership type config
+        self.type_config = self.config['membership_types'].get(membership_type, {})
+        self.rules = self.type_config.get('rules', {})
+        self.pricing = self.type_config.get('pricing', {})
+
+        # Get expected dues for this location
+        self.expected_dues = self.pricing.get(location, 0) or 0
 
     @staticmethod
-    def parse_date(date_str: str) -> datetime:
+    def parse_date(date_str: str) -> Optional[datetime]:
         """Parse date in M/D/YY format"""
+        if not date_str or not date_str.strip():
+            return None
         try:
-            return datetime.strptime(date_str, '%m/%d/%y')
+            return datetime.strptime(date_str.strip(), '%m/%d/%y')
         except:
             return None
 
     @staticmethod
-    def parse_currency(currency_str: str) -> float:
+    def parse_currency(currency_str: str) -> Optional[float]:
         """Parse currency value, handling commas and quotes"""
+        if not currency_str:
+            return None
         try:
-            cleaned = currency_str.replace(',', '').replace('"', '').strip()
+            cleaned = currency_str.replace(',', '').replace('"', '').replace('$', '').strip()
             return float(cleaned)
         except:
             return None
 
-    def check_date_difference(self, row: List[str]) -> Tuple[bool, RedFlag]:
+    def check_date_difference(self, row: List[str]) -> Tuple[bool, Optional[RedFlag]]:
         """
-        Check if join date and expiration date are exactly one year apart
-
-        Returns:
-            (is_flagged, RedFlag or None)
+        Check if join date and expiration date meet the membership type requirements
         """
         join_date = self.parse_date(row[self.COL_JOIN_DATE])
         exp_date = self.parse_date(row[self.COL_EXP_DATE])
 
         if not join_date or not exp_date:
-            return True, RedFlag(
-                "date_invalid",
-                "Invalid date format"
-            )
+            return True, RedFlag("date_invalid", "Invalid date format")
 
         diff_days = (exp_date - join_date).days
-        expected_min = self.rules.get('date_diff_min_days', 365)
-        expected_max = self.rules.get('date_diff_max_days', 366)
+        date_rule_type = self.rules.get('date_rule_type', 'exact_range')
 
-        if not (expected_min <= diff_days <= expected_max):
+        if date_rule_type == 'exact_range':
+            # For 1 Year: must be exactly 365-366 days
+            min_days = self.rules.get('date_diff_min_days', 365)
+            max_days = self.rules.get('date_diff_max_days', 366)
+
+            if not (min_days <= diff_days <= max_days):
+                return True, RedFlag(
+                    "date_mismatch",
+                    f"Exp date not within expected range ({diff_days} days, expected {min_days}-{max_days})",
+                    diff_days
+                )
+
+        elif date_rule_type == 'max_only':
+            # For 3 Month / 1 Month: flag if exceeds max
+            max_days = self.rules.get('date_diff_max_days', 31)
+
+            if diff_days > max_days:
+                return True, RedFlag(
+                    "date_mismatch",
+                    f"Exp date exceeds maximum ({diff_days} days, max {max_days})",
+                    diff_days
+                )
+
+        return False, None
+
+    def check_expiration_year(self, row: List[str]) -> Tuple[bool, Optional[RedFlag]]:
+        """
+        Check if expiration date year matches expected (for Month-to-Month)
+        """
+        expected_year = self.rules.get('expected_exp_year')
+        if expected_year is None:
+            return False, None
+
+        exp_date = self.parse_date(row[self.COL_EXP_DATE])
+        if not exp_date:
+            return True, RedFlag("date_invalid", "Invalid expiration date")
+
+        if exp_date.year != expected_year:
             return True, RedFlag(
-                "date_mismatch",
-                f"Join/Exp dates not 1 year apart ({diff_days} days)",
-                diff_days
+                "exp_year_wrong",
+                f"Exp year should be {expected_year} (found {exp_date.year})",
+                exp_date.year
             )
 
         return False, None
 
-    def check_dues_amount(self, row: List[str]) -> Tuple[bool, RedFlag]:
+    def check_dues_amount(self, row: List[str]) -> Tuple[bool, Optional[RedFlag]]:
         """
-        Check if dues amount meets minimum threshold
+        Check if dues amount meets the threshold percentage
+        """
+        if self.expected_dues == 0:
+            return False, None  # No dues check if pricing not set
 
-        Returns:
-            (is_flagged, RedFlag or None)
-        """
         dues_amt = self.parse_currency(row[self.COL_DUES_AMT])
 
         if dues_amt is None:
-            return True, RedFlag(
-                "dues_invalid",
-                "Invalid dues amount"
-            )
+            return True, RedFlag("dues_invalid", "Invalid dues amount")
 
-        min_dues = self.rules.get('min_dues_amount', 600)
+        threshold_percent = self.rules.get('payment_threshold_percent', 90)
+        min_dues = self.expected_dues * (threshold_percent / 100)
 
         if dues_amt < min_dues:
             return True, RedFlag(
                 "dues_low",
-                f"Dues < ${min_dues} (${dues_amt:.2f})",
+                f"Dues ${dues_amt:.2f} < {threshold_percent}% of ${self.expected_dues:.2f} (min ${min_dues:.2f})",
                 dues_amt
             )
 
         return False, None
 
-    def check_pay_type(self, row: List[str]) -> Tuple[bool, RedFlag]:
+    def check_cycle(self, row: List[str]) -> Tuple[bool, Optional[RedFlag]]:
         """
-        Check if pay type matches expected value
-
-        Returns:
-            (is_flagged, RedFlag or None)
+        Check if cycle value meets requirements
         """
-        pay_type = row[self.COL_PAY_TYPE].strip()
-        expected = self.rules.get('expected_pay_type', 'ANNUAL BILL')
+        try:
+            cycle = int(row[self.COL_CYCLE])
+        except:
+            return True, RedFlag("cycle_invalid", "Invalid cycle value")
 
-        if pay_type.upper() != expected.upper():
+        cycle_rule_type = self.rules.get('cycle_rule_type', 'exact')
+
+        if cycle_rule_type == 'exact':
+            expected = self.rules.get('expected_cycle')
+            if expected is not None and cycle != expected:
+                return True, RedFlag(
+                    "cycle_wrong",
+                    f"Cycle should be {expected} (found {cycle})",
+                    cycle
+                )
+
+        elif cycle_rule_type == 'max':
+            max_cycle = self.rules.get('cycle_max')
+            if max_cycle is not None and cycle > max_cycle:
+                return True, RedFlag(
+                    "cycle_exceeds_max",
+                    f"Cycle {cycle} exceeds maximum of {max_cycle}",
+                    cycle
+                )
+
+        return False, None
+
+    def check_balance(self, row: List[str]) -> Tuple[bool, Optional[RedFlag]]:
+        """
+        Check if balance is as expected (usually 0)
+        """
+        if not self.rules.get('check_balance', True):
+            return False, None
+
+        balance = self.parse_currency(row[self.COL_BALANCE])
+
+        if balance is None:
+            return True, RedFlag("balance_invalid", "Invalid balance")
+
+        expected_balance = self.rules.get('expected_balance', 0)
+
+        if balance != expected_balance:
+            balance_type = "credit" if balance < 0 else "debit"
             return True, RedFlag(
-                "pay_type_wrong",
-                f"Pay Type: {pay_type}",
-                pay_type
+                f"balance_{balance_type}",
+                f"Balance: ${balance:.2f} ({balance_type}), expected ${expected_balance:.2f}",
+                balance
             )
 
         return False, None
 
-    def check_end_draft_date(self, row: List[str]) -> Tuple[bool, RedFlag]:
+    def check_end_draft_date(self, row: List[str]) -> Tuple[bool, Optional[RedFlag]]:
         """
-        Check if end draft date matches expected placeholder
+        Check if end draft date meets requirements
+        """
+        if not self.rules.get('check_end_draft', False):
+            # Check for year-based rule (Month-to-Month)
+            expected_year = self.rules.get('expected_end_draft_year')
+            if expected_year is None:
+                return False, None
 
-        Returns:
-            (is_flagged, RedFlag or None)
-        """
+            end_draft_str = row[self.COL_END_DRAFT].strip()
+            end_draft = self.parse_date(end_draft_str)
+
+            if not end_draft:
+                return True, RedFlag("end_draft_invalid", "Invalid end draft date")
+
+            if end_draft.year != expected_year:
+                return True, RedFlag(
+                    "end_draft_year_wrong",
+                    f"End draft year should be {expected_year} (found {end_draft.year})",
+                    end_draft.year
+                )
+
+            return False, None
+
+        # Original exact match check
         end_draft = row[self.COL_END_DRAFT].strip()
         expected = self.rules.get('expected_end_draft', '12/31/99')
 
         if end_draft != expected:
             return True, RedFlag(
                 "end_draft_wrong",
-                f"End Draft: {end_draft}",
+                f"End Draft: {end_draft} (expected {expected})",
                 end_draft
             )
 
         return False, None
 
-    def check_cycle(self, row: List[str]) -> Tuple[bool, RedFlag]:
+    def check_draft_date(self, row: List[str]) -> Tuple[bool, Optional[RedFlag]]:
         """
-        Check if cycle number matches expected value
-
-        Returns:
-            (is_flagged, RedFlag or None)
+        Check if draft date is within acceptable range from join date (for Month-to-Month)
         """
-        try:
-            cycle = int(row[self.COL_CYCLE])
-            expected = self.rules.get('expected_cycle', 1)
+        max_months = self.rules.get('draft_date_max_months_from_join')
+        if max_months is None:
+            return False, None
 
-            if cycle != expected:
-                return True, RedFlag(
-                    "cycle_wrong",
-                    f"Cycle: {cycle}",
-                    cycle
-                )
-        except:
+        join_date = self.parse_date(row[self.COL_JOIN_DATE])
+        draft_date = self.parse_date(row[self.COL_START_DRAFT])
+
+        if not join_date or not draft_date:
+            return False, None  # Can't check without valid dates
+
+        diff_days = (draft_date - join_date).days
+        max_days = max_months * 31  # Approximate
+
+        if diff_days > max_days:
             return True, RedFlag(
-                "cycle_invalid",
-                "Invalid cycle value"
-            )
-
-        return False, None
-
-    def check_balance(self, row: List[str]) -> Tuple[bool, RedFlag]:
-        """
-        Check if balance is exactly zero
-
-        Returns:
-            (is_flagged, RedFlag or None)
-        """
-        balance = self.parse_currency(row[self.COL_BALANCE])
-
-        if balance is None:
-            return True, RedFlag(
-                "balance_invalid",
-                "Invalid balance"
-            )
-
-        if balance != 0:
-            balance_type = "credit" if balance < 0 else "debit"
-            return True, RedFlag(
-                f"balance_{balance_type}",
-                f"Balance: ${balance:.2f} ({balance_type})",
-                balance
+                "draft_date_too_far",
+                f"Draft date is {diff_days} days from join date (max ~{max_days} days / {max_months} months)",
+                diff_days
             )
 
         return False, None
 
     def check_all(self, row: List[str]) -> List[RedFlag]:
         """
-        Run all red flag checks on a row
+        Run all applicable red flag checks on a row
 
         Args:
             row: List representing a CSV row
@@ -221,31 +305,32 @@ class RedFlagChecker:
         """
         red_flags = []
 
-        # Run all checks
+        # List of all checks to run
         checks = [
             self.check_date_difference,
+            self.check_expiration_year,
             self.check_dues_amount,
-            self.check_pay_type,
-            self.check_end_draft_date,
             self.check_cycle,
-            self.check_balance
+            self.check_balance,
+            self.check_end_draft_date,
+            self.check_draft_date,
         ]
 
         for check_func in checks:
             is_flagged, flag = check_func(row)
-            if is_flagged:
+            if is_flagged and flag:
                 red_flags.append(flag)
 
         return red_flags
 
-    def calculate_membership_age(self, row: List[str]) -> int:
+    def calculate_membership_age(self, row: List[str]) -> Optional[int]:
         """Calculate days since join date"""
         join_date = self.parse_date(row[self.COL_JOIN_DATE])
         if join_date:
             return (datetime.now() - join_date).days
         return None
 
-    def is_membership_expired(self, row: List[str]) -> bool:
+    def is_membership_expired(self, row: List[str]) -> Optional[bool]:
         """Check if membership is expired"""
         exp_date = self.parse_date(row[self.COL_EXP_DATE])
         if exp_date:
@@ -263,9 +348,11 @@ class RedFlagChecker:
         for flag in red_flags:
             if flag.flag_type in ['dues_low', 'dues_invalid']:
                 # Missing dues (expected - actual)
-                expected = self.rules.get('min_dues_amount', 600)
                 actual = self.parse_currency(row[self.COL_DUES_AMT]) or 0
-                impact += (expected - actual)
+                if self.expected_dues > 0:
+                    threshold = self.expected_dues * (self.rules.get('payment_threshold_percent', 90) / 100)
+                    if actual < threshold:
+                        impact += (threshold - actual)
 
             elif flag.flag_type.startswith('balance_'):
                 # Outstanding balance
@@ -286,13 +373,13 @@ class RedFlagChecker:
 
         for flag in red_flags:
             if flag.flag_type in ['dues_low', 'dues_invalid']:
-                # Missing dues (expected - actual)
-                expected = self.rules.get('min_dues_amount', 600)
                 actual = self.parse_currency(row[self.COL_DUES_AMT]) or 0
-                dues_impact += (expected - actual)
+                if self.expected_dues > 0:
+                    threshold = self.expected_dues * (self.rules.get('payment_threshold_percent', 90) / 100)
+                    if actual < threshold:
+                        dues_impact += (threshold - actual)
 
             elif flag.flag_type.startswith('balance_'):
-                # Outstanding balance
                 balance = abs(flag.value) if flag.value else 0
                 balance_impact += balance
 
@@ -303,20 +390,77 @@ class RedFlagChecker:
         }
 
 
-def create_default_checker() -> RedFlagChecker:
+def load_config(config_path: str = None) -> Dict[str, Any]:
     """
-    Create a RedFlagChecker with default rules for Year Paid in Full memberships
+    Load the red flag rules configuration
+
+    Args:
+        config_path: Path to config file (optional)
+
+    Returns:
+        Configuration dictionary
+    """
+    if config_path is None:
+        config_path = Path(__file__).parent.parent / 'config' / 'red_flag_rules.json'
+
+    with open(config_path, 'r') as f:
+        return json.load(f)
+
+
+def get_locations(config: Dict[str, Any] = None) -> Dict[str, str]:
+    """
+    Get available locations
+
+    Returns:
+        Dictionary mapping location key to display name
+    """
+    if config is None:
+        config = load_config()
+
+    return {
+        key: loc['display_name']
+        for key, loc in config.get('locations', {}).items()
+    }
+
+
+def get_membership_types(config: Dict[str, Any] = None) -> Dict[str, str]:
+    """
+    Get available membership types
+
+    Returns:
+        Dictionary mapping type key to display name
+    """
+    if config is None:
+        config = load_config()
+
+    return {
+        key: mt['name']
+        for key, mt in config.get('membership_types', {}).items()
+        if mt.get('enabled', True)
+    }
+
+
+def create_checker(membership_type: str, location: str) -> RedFlagChecker:
+    """
+    Create a RedFlagChecker for the specified membership type and location
+
+    Args:
+        membership_type: Key from config (e.g., '1_year_paid_in_full')
+        location: Key from config (e.g., 'bqe', 'greenpoint', 'lic')
 
     Returns:
         Configured RedFlagChecker instance
     """
-    default_rules = {
-        'date_diff_min_days': 365,
-        'date_diff_max_days': 366,
-        'min_dues_amount': 600,
-        'expected_pay_type': 'ANNUAL BILL',
-        'expected_end_draft': '12/31/99',
-        'expected_cycle': 1
-    }
+    return RedFlagChecker(membership_type, location)
 
-    return RedFlagChecker(default_rules)
+
+# Backwards compatibility
+def create_default_checker() -> RedFlagChecker:
+    """
+    Create a RedFlagChecker with default rules (1 Year Paid in Full, BQE)
+    For backwards compatibility
+
+    Returns:
+        Configured RedFlagChecker instance
+    """
+    return RedFlagChecker('1_year_paid_in_full', 'bqe')
