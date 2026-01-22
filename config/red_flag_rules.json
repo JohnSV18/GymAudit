@@ -23,12 +23,12 @@
         "lic": 1500
       },
       "rules": {
-        "date_diff_max_days": 366,
-        "date_diff_min_days": 365,
-        "date_rule_type": "exact_range",
+        "date_diff_max_days": 365,
+        "date_rule_type": "max_only",
         "payment_threshold_percent": 90,
+        "check_cycle": false,
         "expected_cycle": 0,
-        "check_balance": true,
+        "check_balance": false,
         "expected_balance": 0,
         "check_pay_type": false,
         "check_end_draft": false
@@ -47,9 +47,9 @@
         "date_diff_max_days": 93,
         "date_rule_type": "max_only",
         "payment_threshold_percent": 90,
-        "cycle_max": 3,
-        "cycle_rule_type": "max",
-        "check_balance": true,
+        "check_cycle": false,
+        "expected_cycle": 0,
+        "check_balance": false,
         "expected_balance": 0,
         "check_pay_type": false,
         "check_end_draft": false
@@ -68,8 +68,9 @@
         "date_diff_max_days": 31,
         "date_rule_type": "max_only",
         "payment_threshold_percent": 90,
+        "check_cycle": false,
         "expected_cycle": 0,
-        "check_balance": true,
+        "check_balance": false,
         "expected_balance": 0,
         "check_pay_type": false,
         "check_end_draft": false
@@ -79,6 +80,7 @@
     "month_to_month": {
       "name": "Month to Month",
       "description": "Recurring monthly membership",
+      "member_type_identifier": "MTMCORE",
       "pricing": {
         "bqe": null,
         "greenpoint": null,
@@ -86,17 +88,44 @@
       },
       "rules": {
         "expected_exp_year": 2099,
+        "check_cycle": false,
         "expected_cycle": 1,
         "draft_date_max_months_from_join": 3,
         "expected_end_draft_year": 2099,
-        "min_monthly_fee": 59.99,
-        "check_balance": true,
+        "min_monthly_fee": {
+          "bqe": 59.99,
+          "greenpoint": 59.99,
+          "lic": 59.99
+        },
+        "grace_period_months": 3,
+        "check_balance": false,
         "expected_balance": 0,
-        "check_pay_type": false
+        "check_pay_type": false,
+        "check_monthly_payments": false
       },
       "enabled": true,
       "notes": "Pricing TBD - will be updated later"
+    },
+    "all_membership_types": {
+      "name": "All Membership Types",
+      "description": "Process all membership types and generate grouped report",
+      "pricing": {},
+      "rules": {},
+      "enabled": true,
+      "notes": "Groups data by member_type column and applies appropriate rules per type"
     }
+  },
+  "member_type_mapping": {
+    "1MCORE": "1_month_paid_in_full",
+    "1YRCORE": "1_year_paid_in_full",
+    "3MCORE": "3_months_paid_in_full",
+    "MTMCORE": "month_to_month"
+  },
+  "bp_detection": {
+    "enabled": true,
+    "columns": ["code", "member_type", "member_group"],
+    "keywords": ["bp", "billing"],
+    "case_sensitive": false
   },
   "version": "2.0.0",
   "last_updated": "2026-01-19",

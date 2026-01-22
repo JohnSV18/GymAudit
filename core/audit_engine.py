@@ -6,7 +6,10 @@ Supports multiple membership types and locations
 
 from typing import List, Dict, Any, Optional
 from pathlib import Path
-from .red_flags import RedFlagChecker, create_checker
+from datetime import datetime
+from dateutil.relativedelta import relativedelta
+from collections import defaultdict
+from .red_flags import RedFlagChecker, RedFlag, create_checker, load_config
 from .file_handler import MembershipFileReader
 from .report_generator import AuditReportGenerator
 
@@ -18,7 +21,8 @@ class AuditEngine:
         self,
         membership_type: str,
         location: str,
-        output_folder: str = 'outputs'
+        output_folder: str = 'outputs',
+        format_type: str = 'old'
     ):
         """
         Initialize audit engine with membership type and location
@@ -27,12 +31,23 @@ class AuditEngine:
             membership_type: Key from config (e.g., '1_year_paid_in_full', '3_months_paid_in_full')
             location: Key from config (e.g., 'bqe', 'greenpoint', 'lic')
             output_folder: Directory for output reports
+            format_type: 'old' for 17-column format, 'new' for 20-column format
         """
         self.membership_type = membership_type
         self.location = location
-        self.checker = create_checker(membership_type, location)
+        self.format_type = format_type
+        self.checker = create_checker(membership_type, location, format_type=format_type)
         self.file_reader = MembershipFileReader()
         self.report_generator = AuditReportGenerator(output_folder)
+
+        # Load BP detection config
+        config = load_config()
+        self.bp_config = config.get('bp_detection', {
+            'enabled': True,
+            'columns': ['code', 'member_type'],
+            'keywords': ['bp', 'billing'],
+            'case_sensitive': False
+        })
 
     def audit_rows(self, data_rows: List[List[str]]) -> List[Dict[str, Any]]:
         """
@@ -96,6 +111,12 @@ class AuditEngine:
                 'filename': file_data['filename']
             }
 
+        # Update checker format if file format differs from engine default
+        detected_format = file_data.get('format_type', 'old')
+        if detected_format != self.format_type:
+            self.checker = create_checker(self.membership_type, self.location, format_type=detected_format)
+            self.format_type = detected_format
+
         # Audit the rows
         audit_results = self.audit_rows(file_data['data_rows'])
 
@@ -111,6 +132,9 @@ class AuditEngine:
         # Get flagged member IDs
         flagged_member_ids = [r['member_id'] for r in audit_results if r['has_flags']]
 
+        # Get column mapping for BP detection
+        column_mapping = self.checker.get_bp_detection_columns()
+
         # Generate report if requested
         report_path = None
         if generate_report:
@@ -123,12 +147,15 @@ class AuditEngine:
                 data_rows=file_data['data_rows'],
                 audit_results=audit_results,
                 output_filename=output_filename,
-                include_summary_sheet=True
+                include_summary_sheet=True,
+                column_mapping=column_mapping,
+                bp_config=self.bp_config
             )
 
         return {
             'success': True,
             'filename': file_data['filename'],
+            'format_type': detected_format,
             'total_records': total_records,
             'flagged_count': flagged_count,
             'clean_count': clean_count,
@@ -169,6 +196,12 @@ class AuditEngine:
                 'filename': file_data['filename']
             }
 
+        # Update checker format if file format differs from engine default
+        detected_format = file_data.get('format_type', 'old')
+        if detected_format != self.format_type:
+            self.checker = create_checker(self.membership_type, self.location, format_type=detected_format)
+            self.format_type = detected_format
+
         # Audit the rows
         audit_results = self.audit_rows(file_data['data_rows'])
 
@@ -184,6 +217,9 @@ class AuditEngine:
         # Get flagged member IDs
         flagged_member_ids = [r['member_id'] for r in audit_results if r['has_flags']]
 
+        # Get column mapping for BP detection
+        column_mapping = self.checker.get_bp_detection_columns()
+
         # Generate report if requested
         report_path = None
         if generate_report:
@@ -196,12 +232,15 @@ class AuditEngine:
                 data_rows=file_data['data_rows'],
                 audit_results=audit_results,
                 output_filename=output_filename,
-                include_summary_sheet=True
+                include_summary_sheet=True,
+                column_mapping=column_mapping,
+                bp_config=self.bp_config
             )
 
         return {
             'success': True,
             'filename': file_data['filename'],
+            'format_type': detected_format,
             'total_records': total_records,
             'flagged_count': flagged_count,
             'clean_count': clean_count,
@@ -306,4 +345,579 @@ class AuditEngine:
             'total_financial_impact': total_financial_impact,
             'file_results': all_results,
             'consolidated_report_path': consolidated_report_path
+        }
+
+    def _parse_date(self, date_str: str) -> Optional[datetime]:
+        """Parse date in M/D/YY format"""
+        if not date_str or not date_str.strip():
+            return None
+        try:
+            return datetime.strptime(date_str.strip(), '%m/%d/%y')
+        except:
+            return None
+
+    def _parse_currency(self, currency_str: str) -> Optional[float]:
+        """Parse currency value, handling commas and quotes"""
+        if not currency_str:
+            return None
+        try:
+            cleaned = currency_str.replace(',', '').replace('"', '').replace('$', '').strip()
+            return float(cleaned)
+        except:
+            return None
+
+    def _get_month_key(self, date: datetime) -> str:
+        """Get year-month key from date (e.g., '2026-01')"""
+        return date.strftime('%Y-%m')
+
+    def _get_member_key(self, row: List[str]) -> str:
+        """
+        Create unique member key from first_name + last_name + member_number.
+        Uses new format column indices.
+        """
+        first_name = row[self.checker.NEW_FORMAT_COLUMNS['first_name']].strip().lower()
+        last_name = row[self.checker.NEW_FORMAT_COLUMNS['last_name']].strip().lower()
+        member_number = row[self.checker.NEW_FORMAT_COLUMNS['member_number']].strip()
+        return f"{first_name}|{last_name}|{member_number}"
+
+    def _is_mtmcore_member(self, row: List[str]) -> bool:
+        """Check if member type is MTMCORE"""
+        member_type_idx = self.checker.NEW_FORMAT_COLUMNS['member_type']
+        if member_type_idx < len(row):
+            member_type = row[member_type_idx].strip().upper()
+            return member_type == 'MTMCORE'
+        return False
+
+    def _check_basic_mtm_rules(self, row: List[str]) -> List:
+        """
+        Check basic Month-to-Month validation rules on a single row.
+
+        Rules:
+        - Expiration year = 2099
+        - Cycle = 1
+        - Start draft date within 3 months of join date
+        - End draft year = 2099
+        """
+        from .red_flags import RedFlag
+
+        flags = []
+        cols = self.checker.NEW_FORMAT_COLUMNS
+        rules = self.checker.rules
+
+        # Check expiration year
+        exp_date_str = row[cols['expiration_date']] if cols['expiration_date'] < len(row) else ''
+        exp_date = self._parse_date(exp_date_str)
+        expected_exp_year = rules.get('expected_exp_year', 2099)
+        if exp_date and exp_date.year != expected_exp_year:
+            flags.append(RedFlag(
+                "exp_year_wrong",
+                f"Exp year should be {expected_exp_year} (found {exp_date.year})",
+                exp_date.year
+            ))
+
+        # Check start draft date (within 3 months of join date)
+        join_date_str = row[cols['join_date']] if cols['join_date'] < len(row) else ''
+        start_draft_str = row[cols['start_draft']] if cols['start_draft'] < len(row) else ''
+        join_date = self._parse_date(join_date_str)
+        start_draft = self._parse_date(start_draft_str)
+
+        max_months = rules.get('draft_date_max_months_from_join', 3)
+        if join_date and start_draft:
+            diff_days = (start_draft - join_date).days
+            max_days = max_months * 31  # Approximate
+            if diff_days > max_days:
+                flags.append(RedFlag(
+                    "draft_date_too_far",
+                    f"Draft date is {diff_days} days from join date (max ~{max_days} days / {max_months} months)",
+                    diff_days
+                ))
+
+        # Check end draft year
+        end_draft_str = row[cols['end_draft']] if cols['end_draft'] < len(row) else ''
+        end_draft = self._parse_date(end_draft_str)
+        expected_end_year = rules.get('expected_end_draft_year', 2099)
+        if end_draft and end_draft.year != expected_end_year:
+            flags.append(RedFlag(
+                "end_draft_year_wrong",
+                f"End draft year should be {expected_end_year} (found {end_draft.year})",
+                end_draft.year
+            ))
+
+        return flags
+
+    def audit_month_to_month_transactions(
+        self,
+        data_rows: List[List[str]],
+        system_date: datetime = None
+    ) -> Dict[str, Any]:
+        """
+        Audit Month-to-Month membership transactions.
+
+        Groups transactions by member and checks:
+        1. Basic validation rules (exp year, cycle, draft dates)
+        2. Monthly payment verification (after 3-month grace period)
+        3. Duplicate payment detection
+
+        Args:
+            data_rows: List of transaction rows (new format)
+            system_date: Current system date (defaults to today)
+
+        Returns:
+            Dictionary with member-level audit results
+        """
+        from .red_flags import RedFlag
+
+        if system_date is None:
+            system_date = datetime.now()
+
+        cols = self.checker.NEW_FORMAT_COLUMNS
+        min_monthly_fee = self.checker.get_min_monthly_fee()
+        grace_months = self.checker.get_grace_period_months()
+
+        # Group transactions by member
+        member_transactions = defaultdict(list)
+        for row in data_rows:
+            if not self._is_mtmcore_member(row):
+                continue
+            member_key = self._get_member_key(row)
+            member_transactions[member_key].append(row)
+
+        member_results = {}
+
+        for member_key, transactions in member_transactions.items():
+            # Use first transaction for member info and basic checks
+            first_row = transactions[0]
+
+            # Get member info
+            first_name = first_row[cols['first_name']]
+            last_name = first_row[cols['last_name']]
+            member_number = first_row[cols['member_number']]
+
+            # Get join date (same for all transactions)
+            join_date_str = first_row[cols['join_date']]
+            join_date = self._parse_date(join_date_str)
+
+            if not join_date:
+                member_results[member_key] = {
+                    'member_key': member_key,
+                    'first_name': first_name,
+                    'last_name': last_name,
+                    'member_number': member_number,
+                    'transactions': transactions,
+                    'flags': [RedFlag("join_date_invalid", "Invalid join date")],
+                    'missing_months': [],
+                    'duplicate_months': [],
+                    'has_flags': True
+                }
+                continue
+
+            # Calculate grace period end
+            grace_end = join_date + relativedelta(months=grace_months)
+
+            # Get all required months from grace_end to system_date
+            required_months = []
+            current_month = datetime(grace_end.year, grace_end.month, 1)
+            system_month = datetime(system_date.year, system_date.month, 1)
+
+            while current_month <= system_month:
+                required_months.append(self._get_month_key(current_month))
+                current_month += relativedelta(months=1)
+
+            # Get payment months from transactions (where amount >= min_monthly_fee)
+            payment_months = defaultdict(list)  # month -> list of transaction indices
+            for idx, txn in enumerate(transactions):
+                txn_date_str = txn[cols['transaction_date']]
+                txn_date = self._parse_date(txn_date_str)
+                amount = self._parse_currency(txn[cols['amount']])
+
+                if txn_date and amount is not None and amount >= min_monthly_fee:
+                    month_key = self._get_month_key(txn_date)
+                    payment_months[month_key].append(idx)
+
+            # Check for missing payments
+            missing_months = []
+            for required_month in required_months:
+                if required_month not in payment_months:
+                    missing_months.append(required_month)
+
+            # Check for duplicate payments
+            duplicate_months = []
+            for month_key, txn_indices in payment_months.items():
+                if len(txn_indices) > 1:
+                    duplicate_months.append(month_key)
+
+            # Run basic validation rules on first transaction
+            basic_flags = self._check_basic_mtm_rules(first_row)
+
+            # Create flags for missing/duplicate payments
+            all_flags = basic_flags.copy()
+
+            for missing_month in missing_months:
+                all_flags.append(RedFlag(
+                    "missing_payment",
+                    f"No qualifying payment (>= ${min_monthly_fee:.2f}) for {missing_month}",
+                    missing_month
+                ))
+
+            for dup_month in duplicate_months:
+                all_flags.append(RedFlag(
+                    "duplicate_payment",
+                    f"Multiple transactions in {dup_month}",
+                    dup_month
+                ))
+
+            member_results[member_key] = {
+                'member_key': member_key,
+                'first_name': first_name,
+                'last_name': last_name,
+                'member_number': member_number,
+                'join_date': join_date,
+                'grace_end': grace_end,
+                'transactions': transactions,
+                'transaction_count': len(transactions),
+                'flags': all_flags,
+                'missing_months': missing_months,
+                'duplicate_months': duplicate_months,
+                'required_months': required_months,
+                'payment_months': list(payment_months.keys()),
+                'has_flags': len(all_flags) > 0,
+                'flag_count': len(all_flags)
+            }
+
+        return {
+            'member_results': member_results,
+            'total_members': len(member_results),
+            'flagged_members': sum(1 for r in member_results.values() if r['has_flags']),
+            'total_transactions': sum(len(r['transactions']) for r in member_results.values())
+        }
+
+    def audit_mtm_file(self, file_path: str, generate_report: bool = True) -> Dict[str, Any]:
+        """
+        Audit a Month-to-Month transaction file.
+
+        Args:
+            file_path: Path to transaction file
+            generate_report: Whether to generate Excel report
+
+        Returns:
+            Dictionary with audit results and statistics
+        """
+        # Read and validate file
+        file_data = self.file_reader.read_and_validate(file_path)
+
+        if not file_data['is_valid']:
+            return {
+                'success': False,
+                'error': file_data['error'],
+                'filename': file_data['filename']
+            }
+
+        # Ensure we're using new format
+        detected_format = file_data.get('format_type', 'old')
+        if detected_format != 'new':
+            return {
+                'success': False,
+                'error': "MTM audit requires new format (20-column) transaction data",
+                'filename': file_data['filename']
+            }
+
+        # Update checker to new format
+        self.checker = create_checker(self.membership_type, self.location, format_type='new')
+        self.format_type = 'new'
+
+        # Run MTM transaction audit
+        mtm_results = self.audit_month_to_month_transactions(file_data['data_rows'])
+
+        # Get column mapping for BP detection
+        column_mapping = self.checker.get_bp_detection_columns()
+
+        # Generate report if requested
+        report_path = None
+        if generate_report:
+            original_name = Path(file_data['filename']).stem
+            output_filename = f"{original_name}_MTM_Audit_Report.xlsx"
+
+            report_path = self.report_generator.create_mtm_audit_report(
+                header_row=file_data['header'],
+                mtm_results=mtm_results,
+                output_filename=output_filename,
+                column_mapping=column_mapping,
+                bp_config=self.bp_config
+            )
+
+        return {
+            'success': True,
+            'filename': file_data['filename'],
+            'format_type': detected_format,
+            'total_members': mtm_results['total_members'],
+            'flagged_members': mtm_results['flagged_members'],
+            'total_transactions': mtm_results['total_transactions'],
+            'member_results': mtm_results['member_results'],
+            'report_path': report_path
+        }
+
+    def audit_mtm_uploaded_file(self, uploaded_file, generate_report: bool = True) -> Dict[str, Any]:
+        """
+        Audit an uploaded Month-to-Month transaction file.
+
+        Args:
+            uploaded_file: Streamlit UploadedFile object
+            generate_report: Whether to generate Excel report
+
+        Returns:
+            Dictionary with audit results and statistics
+        """
+        try:
+            file_data = self.file_reader.read_and_validate_upload(uploaded_file)
+        except Exception as e:
+            return {
+                'success': False,
+                'error': str(e),
+                'filename': uploaded_file.name if hasattr(uploaded_file, 'name') else 'Unknown'
+            }
+
+        if not file_data['is_valid']:
+            return {
+                'success': False,
+                'error': file_data['error'],
+                'filename': file_data['filename']
+            }
+
+        # Ensure we're using new format
+        detected_format = file_data.get('format_type', 'old')
+        if detected_format != 'new':
+            return {
+                'success': False,
+                'error': "MTM audit requires new format (20-column) transaction data",
+                'filename': file_data['filename']
+            }
+
+        # Update checker to new format
+        self.checker = create_checker(self.membership_type, self.location, format_type='new')
+        self.format_type = 'new'
+
+        # Run MTM transaction audit
+        mtm_results = self.audit_month_to_month_transactions(file_data['data_rows'])
+
+        # Get column mapping for BP detection
+        column_mapping = self.checker.get_bp_detection_columns()
+
+        # Generate report if requested
+        report_path = None
+        if generate_report:
+            original_name = Path(file_data['filename']).stem
+            output_filename = f"{original_name}_MTM_Audit_Report.xlsx"
+
+            report_path = self.report_generator.create_mtm_audit_report(
+                header_row=file_data['header'],
+                mtm_results=mtm_results,
+                output_filename=output_filename,
+                column_mapping=column_mapping,
+                bp_config=self.bp_config
+            )
+
+        return {
+            'success': True,
+            'filename': file_data['filename'],
+            'format_type': detected_format,
+            'total_members': mtm_results['total_members'],
+            'flagged_members': mtm_results['flagged_members'],
+            'total_transactions': mtm_results['total_transactions'],
+            'member_results': mtm_results['member_results'],
+            'report_path': report_path
+        }
+
+    def audit_all_membership_types_uploaded(self, uploaded_file, generate_report: bool = True) -> Dict[str, Any]:
+        """
+        Audit an uploaded file containing all membership types.
+        Groups data by member_type column, applies appropriate rules per type,
+        and generates a multi-tab Excel report.
+
+        Args:
+            uploaded_file: Streamlit UploadedFile object
+            generate_report: Whether to generate Excel report
+
+        Returns:
+            Dictionary with audit results grouped by member_type
+        """
+        try:
+            file_data = self.file_reader.read_and_validate_upload(uploaded_file)
+        except Exception as e:
+            return {
+                'success': False,
+                'error': str(e),
+                'filename': uploaded_file.name if hasattr(uploaded_file, 'name') else 'Unknown'
+            }
+
+        if not file_data['is_valid']:
+            return {
+                'success': False,
+                'error': file_data['error'],
+                'filename': file_data['filename']
+            }
+
+        # This requires new format (20-column) for member_type column
+        detected_format = file_data.get('format_type', 'old')
+        if detected_format != 'new':
+            return {
+                'success': False,
+                'error': "All membership types audit requires new format (20-column) data with member_type column",
+                'filename': file_data['filename']
+            }
+
+        # Load config for member_type mapping
+        config = load_config()
+        member_type_mapping = config.get('member_type_mapping', {
+            '1MCORE': '1_month_paid_in_full',
+            '1YRCORE': '1_year_paid_in_full',
+            '3MCORE': '3_months_paid_in_full',
+            'MTMCORE': 'month_to_month'
+        })
+
+        # Get member_type column index (index 9 in new format)
+        member_type_col = 9  # member_type column in new format
+
+        # Group rows by member_type
+        rows_by_type = defaultdict(list)
+        for row in file_data['data_rows']:
+            if len(row) > member_type_col:
+                member_type = row[member_type_col].strip().upper()
+                rows_by_type[member_type].append(row)
+            else:
+                rows_by_type['UNKNOWN'].append(row)
+
+        # Process each member_type group
+        type_results = {}
+        total_records = 0
+        total_flagged = 0
+        total_financial_impact = 0
+
+        for member_type, rows in rows_by_type.items():
+            config_key = member_type_mapping.get(member_type)
+
+            if config_key and config_key != 'month_to_month':
+                # Known non-MTM type - apply standard audit rules
+                type_checker = create_checker(config_key, self.location, format_type='new')
+                audit_results = []
+
+                for row in rows:
+                    red_flags = type_checker.check_all(row)
+                    membership_age = type_checker.calculate_membership_age(row)
+                    is_expired = type_checker.is_membership_expired(row)
+                    financial_impact = type_checker.get_financial_impact(row, red_flags)
+                    impact_breakdown = type_checker.get_financial_impact_breakdown(row, red_flags)
+
+                    result = {
+                        'row_data': row,
+                        'red_flags': red_flags,
+                        'has_flags': len(red_flags) > 0,
+                        'flag_count': len(red_flags),
+                        'membership_age': membership_age,
+                        'is_expired': is_expired,
+                        'financial_impact': financial_impact,
+                        'dues_impact': impact_breakdown['dues_impact'],
+                        'balance_impact': impact_breakdown['balance_impact'],
+                        'member_id': row[type_checker.COL_MEMBER] if len(row) > type_checker.COL_MEMBER else '',
+                        'member_name': f"{row[type_checker.COL_FIRST_NAME]} {row[type_checker.COL_LAST_NAME]}" if len(row) > type_checker.COL_FIRST_NAME else ''
+                    }
+                    audit_results.append(result)
+
+                flagged_count = sum(1 for r in audit_results if r['has_flags'])
+                type_financial_impact = sum(r['financial_impact'] for r in audit_results)
+
+                type_results[member_type] = {
+                    'config_key': config_key,
+                    'is_known_type': True,
+                    'has_rules': True,
+                    'total_records': len(rows),
+                    'flagged_count': flagged_count,
+                    'flagged_percentage': (flagged_count / len(rows) * 100) if rows else 0,
+                    'financial_impact': type_financial_impact,
+                    'audit_results': audit_results,
+                    'rows': rows
+                }
+
+                total_records += len(rows)
+                total_flagged += flagged_count
+                total_financial_impact += type_financial_impact
+
+            elif config_key == 'month_to_month':
+                # MTM type - use transaction-based MTM audit
+                mtm_checker = create_checker('month_to_month', self.location, format_type='new')
+                self.checker = mtm_checker
+                mtm_results = self.audit_month_to_month_transactions(rows)
+
+                type_results[member_type] = {
+                    'config_key': config_key,
+                    'is_known_type': True,
+                    'has_rules': True,
+                    'is_mtm': True,
+                    'total_records': len(rows),
+                    'total_members': mtm_results['total_members'],
+                    'flagged_members': mtm_results['flagged_members'],
+                    'total_transactions': mtm_results['total_transactions'],
+                    'member_results': mtm_results['member_results'],
+                    'rows': rows
+                }
+
+                total_records += len(rows)
+                total_flagged += mtm_results['flagged_members']
+
+            else:
+                # Unknown type - just group data without rules
+                type_results[member_type] = {
+                    'config_key': None,
+                    'is_known_type': False,
+                    'has_rules': False,
+                    'total_records': len(rows),
+                    'flagged_count': 0,
+                    'flagged_percentage': 0,
+                    'financial_impact': 0,
+                    'audit_results': [{'row_data': row, 'red_flags': [], 'has_flags': False} for row in rows],
+                    'rows': rows
+                }
+
+                total_records += len(rows)
+
+        # Get column mapping for BP detection
+        temp_checker = create_checker('1_year_paid_in_full', self.location, format_type='new')
+        column_mapping = temp_checker.get_bp_detection_columns()
+
+        # Generate report if requested
+        report_path = None
+        individual_file_paths = {}
+        if generate_report:
+            original_name = Path(file_data['filename']).stem
+            output_filename = f"{original_name}_All_Types_Audit_Report.xlsx"
+
+            report_path = self.report_generator.create_all_types_report(
+                header_row=file_data['header'],
+                type_results=type_results,
+                output_filename=output_filename,
+                column_mapping=column_mapping,
+                bp_config=self.bp_config,
+                member_type_mapping=member_type_mapping
+            )
+
+            # Generate individual files for each member_type
+            individual_file_paths = self.report_generator.create_individual_type_files(
+                header_row=file_data['header'],
+                type_results=type_results,
+                base_filename=original_name,
+                member_type_mapping=member_type_mapping,
+                column_mapping=column_mapping,
+                bp_config=self.bp_config
+            )
+
+        return {
+            'success': True,
+            'filename': file_data['filename'],
+            'format_type': detected_format,
+            'total_records': total_records,
+            'total_flagged': total_flagged,
+            'total_financial_impact': total_financial_impact,
+            'type_results': type_results,
+            'member_types_found': list(rows_by_type.keys()),
+            'report_path': report_path,
+            'individual_file_paths': individual_file_paths
         }

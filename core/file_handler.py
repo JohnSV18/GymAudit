@@ -18,6 +18,7 @@ class FileReadError(Exception):
 class MembershipFileReader:
     """Reads membership data from CSV and Excel files"""
 
+    # Old format (17 columns)
     REQUIRED_COLUMNS = [
         'Last Name',
         'First Name',
@@ -32,8 +33,46 @@ class MembershipFileReader:
         'End Draft'
     ]
 
+    # New format (20 columns) - required columns for validation
+    REQUIRED_COLUMNS_NEW = [
+        'last_name',
+        'first_name',
+        'member_number',
+        'join_date',
+        'expiration_date',
+        'member_type',
+        'member_group',
+        'code',
+        'payment_method',
+        'dues_amount',
+        'balance',
+        'start_draft',
+        'end_draft'
+    ]
+
+    # Unique indicators for new format detection
+    NEW_FORMAT_INDICATORS = ['transaction_date', 'receipt', 'site_number', 'postedby']
+
     def __init__(self):
         self.supported_extensions = ['.csv', '.xlsx', '.xls']
+
+    def detect_format(self, header_row: List[str]) -> str:
+        """
+        Detect if this is old or new format based on column names.
+
+        Args:
+            header_row: List of column headers
+
+        Returns:
+            'new' for 20-column format, 'old' for 17-column format
+        """
+        header_lower = [col.lower().strip() for col in header_row]
+
+        # New format has these unique columns
+        for indicator in self.NEW_FORMAT_INDICATORS:
+            if any(indicator in col for col in header_lower):
+                return 'new'
+        return 'old'
 
     def is_supported_file(self, filename: str) -> bool:
         """Check if file extension is supported"""
@@ -164,7 +203,7 @@ class MembershipFileReader:
         else:
             raise FileReadError(f"Unsupported file type: {ext}. Supported: {', '.join(self.supported_extensions)}")
 
-    def validate_structure(self, rows: List[List[str]]) -> Tuple[bool, str, int]:
+    def validate_structure(self, rows: List[List[str]]) -> Tuple[bool, str, int, str]:
         """
         Validate that file has expected structure
 
@@ -172,10 +211,10 @@ class MembershipFileReader:
             rows: List of rows from file
 
         Returns:
-            Tuple of (is_valid, error_message, header_row_index)
+            Tuple of (is_valid, error_message, header_row_index, format_type)
         """
         if not rows or len(rows) < 2:
-            return False, "File is empty or has insufficient rows", -1
+            return False, "File is empty or has insufficient rows", -1, 'unknown'
 
         # Check if first row might be a title row (like "Table 1")
         # If so, consider second row as header
@@ -190,11 +229,19 @@ class MembershipFileReader:
 
         header_row = rows[header_row_index]
 
-        # Check for required columns (case-insensitive, partial match)
+        # Detect format type
+        format_type = self.detect_format(header_row)
+
+        # Check for required columns based on format (case-insensitive, partial match)
         header_lower = [col.lower().strip() for col in header_row]
 
+        if format_type == 'new':
+            required_columns = self.REQUIRED_COLUMNS_NEW
+        else:
+            required_columns = self.REQUIRED_COLUMNS
+
         missing_columns = []
-        for required_col in self.REQUIRED_COLUMNS:
+        for required_col in required_columns:
             found = False
             for header_col in header_lower:
                 if required_col.lower() in header_col:
@@ -204,9 +251,9 @@ class MembershipFileReader:
                 missing_columns.append(required_col)
 
         if missing_columns:
-            return False, f"Missing required columns: {', '.join(missing_columns)}", header_row_index
+            return False, f"Missing required columns: {', '.join(missing_columns)}", header_row_index, format_type
 
-        return True, "", header_row_index
+        return True, "", header_row_index, format_type
 
     def get_data_rows(self, rows: List[List[str]], header_row_index: int) -> List[List[str]]:
         """
@@ -242,19 +289,21 @@ class MembershipFileReader:
                 - data_rows: Data rows only
                 - is_valid: Whether structure is valid
                 - error: Error message if invalid
+                - format_type: 'old' or 'new' format
 
         Raises:
             FileReadError: If file cannot be read
         """
         rows, filename = self.read_file(file_path)
-        is_valid, error, header_row_index = self.validate_structure(rows)
+        is_valid, error, header_row_index, format_type = self.validate_structure(rows)
 
         result = {
             'rows': rows,
             'filename': filename,
             'header_row_index': header_row_index,
             'is_valid': is_valid,
-            'error': error
+            'error': error,
+            'format_type': format_type
         }
 
         if is_valid:
@@ -275,14 +324,15 @@ class MembershipFileReader:
             Dictionary with file data and validation results
         """
         rows, filename = self.read_file_from_upload(uploaded_file)
-        is_valid, error, header_row_index = self.validate_structure(rows)
+        is_valid, error, header_row_index, format_type = self.validate_structure(rows)
 
         result = {
             'rows': rows,
             'filename': filename,
             'header_row_index': header_row_index,
             'is_valid': is_valid,
-            'error': error
+            'error': error,
+            'format_type': format_type
         }
 
         if is_valid:

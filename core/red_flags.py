@@ -24,7 +24,7 @@ class RedFlag:
 class RedFlagChecker:
     """Checks membership records for red flags based on configurable rules"""
 
-    # Column indices (matching the CSV structure)
+    # Old format column indices (17-column format)
     COL_LAST_NAME = 0
     COL_FIRST_NAME = 1
     COL_MEMBER = 2
@@ -43,7 +43,35 @@ class RedFlagChecker:
     COL_MEMBERSHIP_LENGTH = 15
     COL_SALES_REP = 16
 
-    def __init__(self, membership_type: str, location: str, config_path: str = None):
+    # New format column indices (20-column format)
+    # last_name, first_name, member_number, transaction_date, transaction_reference,
+    # receipt, amount, join_date, expiration_date, member_type, member_group, code,
+    # payment_method, dues_amount, balance, start_draft, end_draft, contract_date,
+    # site_number, postedby
+    NEW_FORMAT_COLUMNS = {
+        'last_name': 0,
+        'first_name': 1,
+        'member_number': 2,
+        'transaction_date': 3,
+        'transaction_reference': 4,
+        'receipt': 5,
+        'amount': 6,
+        'join_date': 7,
+        'expiration_date': 8,
+        'member_type': 9,
+        'member_group': 10,
+        'code': 11,
+        'payment_method': 12,
+        'dues_amount': 13,
+        'balance': 14,
+        'start_draft': 15,
+        'end_draft': 16,
+        'contract_date': 17,
+        'site_number': 18,
+        'postedby': 19
+    }
+
+    def __init__(self, membership_type: str, location: str, config_path: str = None, format_type: str = 'old'):
         """
         Initialize with membership type and location
 
@@ -51,9 +79,11 @@ class RedFlagChecker:
             membership_type: Key from config (e.g., '1_year_paid_in_full')
             location: Key from config (e.g., 'bqe', 'greenpoint', 'lic')
             config_path: Path to red_flag_rules.json (optional)
+            format_type: 'old' for 17-column format, 'new' for 20-column format
         """
         self.membership_type = membership_type
         self.location = location
+        self.format_type = format_type
 
         # Load config
         if config_path is None:
@@ -69,6 +99,52 @@ class RedFlagChecker:
 
         # Get expected dues for this location
         self.expected_dues = self.pricing.get(location, 0) or 0
+
+    def get_column_index(self, column_name: str) -> int:
+        """
+        Get the column index for a given column name based on format type.
+
+        Args:
+            column_name: Name of the column (e.g., 'join_date', 'code')
+
+        Returns:
+            Column index for the current format
+        """
+        if self.format_type == 'new':
+            return self.NEW_FORMAT_COLUMNS.get(column_name, -1)
+
+        # Old format mapping
+        old_format_mapping = {
+            'last_name': self.COL_LAST_NAME,
+            'first_name': self.COL_FIRST_NAME,
+            'member_number': self.COL_MEMBER,
+            'join_date': self.COL_JOIN_DATE,
+            'expiration_date': self.COL_EXP_DATE,
+            'member_type': self.COL_TYPE,
+            'member_group': self.COL_GROUP,
+            'code': self.COL_CODE,
+            'payment_method': self.COL_PAY_TYPE,
+            'dues_amt': self.COL_DUES_AMT,
+            'dues_amount': self.COL_DUES_AMT,  # Alias for consistency with new format
+            'cycle': self.COL_CYCLE,
+            'balance': self.COL_BALANCE,
+            'start_draft': self.COL_START_DRAFT,
+            'end_draft': self.COL_END_DRAFT,
+        }
+        return old_format_mapping.get(column_name, -1)
+
+    def get_bp_detection_columns(self) -> Dict[str, int]:
+        """
+        Get column indices needed for BP (Billing Problem) detection.
+
+        Returns:
+            Dictionary with 'code', 'member_type', and 'member_group' column indices
+        """
+        return {
+            'code': self.get_column_index('code'),
+            'member_type': self.get_column_index('member_type'),
+            'member_group': self.get_column_index('member_group')
+        }
 
     @staticmethod
     def parse_date(date_str: str) -> Optional[datetime]:
@@ -95,8 +171,12 @@ class RedFlagChecker:
         """
         Check if join date and expiration date meet the membership type requirements
         """
-        join_date = self.parse_date(row[self.COL_JOIN_DATE])
-        exp_date = self.parse_date(row[self.COL_EXP_DATE])
+        # Use format-aware column lookup
+        join_idx = self.get_column_index('join_date')
+        exp_idx = self.get_column_index('expiration_date')
+
+        join_date = self.parse_date(row[join_idx])
+        exp_date = self.parse_date(row[exp_idx])
 
         if not join_date or not exp_date:
             return True, RedFlag("date_invalid", "Invalid date format")
@@ -137,7 +217,9 @@ class RedFlagChecker:
         if expected_year is None:
             return False, None
 
-        exp_date = self.parse_date(row[self.COL_EXP_DATE])
+        # Use format-aware column lookup
+        exp_idx = self.get_column_index('expiration_date')
+        exp_date = self.parse_date(row[exp_idx])
         if not exp_date:
             return True, RedFlag("date_invalid", "Invalid expiration date")
 
@@ -157,7 +239,9 @@ class RedFlagChecker:
         if self.expected_dues == 0:
             return False, None  # No dues check if pricing not set
 
-        dues_amt = self.parse_currency(row[self.COL_DUES_AMT])
+        # Use format-aware column lookup
+        dues_idx = self.get_column_index('dues_amount')
+        dues_amt = self.parse_currency(row[dues_idx])
 
         if dues_amt is None:
             return True, RedFlag("dues_invalid", "Invalid dues amount")
@@ -178,8 +262,17 @@ class RedFlagChecker:
         """
         Check if cycle value meets requirements
         """
+        # Check if cycle checking is disabled in config
+        if not self.rules.get('check_cycle', True):
+            return False, None
+
+        # Use format-aware column lookup
+        cycle_idx = self.get_column_index('cycle')
+        if cycle_idx < 0 or cycle_idx >= len(row):
+            return False, None  # Cycle column not available in this format
+
         try:
-            cycle = int(row[self.COL_CYCLE])
+            cycle = int(row[cycle_idx])
         except:
             return True, RedFlag("cycle_invalid", "Invalid cycle value")
 
@@ -212,7 +305,9 @@ class RedFlagChecker:
         if not self.rules.get('check_balance', True):
             return False, None
 
-        balance = self.parse_currency(row[self.COL_BALANCE])
+        # Use format-aware column lookup
+        balance_idx = self.get_column_index('balance')
+        balance = self.parse_currency(row[balance_idx])
 
         if balance is None:
             return True, RedFlag("balance_invalid", "Invalid balance")
@@ -233,13 +328,16 @@ class RedFlagChecker:
         """
         Check if end draft date meets requirements
         """
+        # Use format-aware column lookup
+        end_draft_idx = self.get_column_index('end_draft')
+
         if not self.rules.get('check_end_draft', False):
             # Check for year-based rule (Month-to-Month)
             expected_year = self.rules.get('expected_end_draft_year')
             if expected_year is None:
                 return False, None
 
-            end_draft_str = row[self.COL_END_DRAFT].strip()
+            end_draft_str = row[end_draft_idx].strip()
             end_draft = self.parse_date(end_draft_str)
 
             if not end_draft:
@@ -255,7 +353,7 @@ class RedFlagChecker:
             return False, None
 
         # Original exact match check
-        end_draft = row[self.COL_END_DRAFT].strip()
+        end_draft = row[end_draft_idx].strip()
         expected = self.rules.get('expected_end_draft', '12/31/99')
 
         if end_draft != expected:
@@ -275,8 +373,12 @@ class RedFlagChecker:
         if max_months is None:
             return False, None
 
-        join_date = self.parse_date(row[self.COL_JOIN_DATE])
-        draft_date = self.parse_date(row[self.COL_START_DRAFT])
+        # Use format-aware column lookup
+        join_idx = self.get_column_index('join_date')
+        start_draft_idx = self.get_column_index('start_draft')
+
+        join_date = self.parse_date(row[join_idx])
+        draft_date = self.parse_date(row[start_draft_idx])
 
         if not join_date or not draft_date:
             return False, None  # Can't check without valid dates
@@ -292,6 +394,27 @@ class RedFlagChecker:
             )
 
         return False, None
+
+    def get_min_monthly_fee(self) -> float:
+        """
+        Get the minimum monthly fee for the current location.
+
+        Returns:
+            Minimum monthly fee amount
+        """
+        min_fee = self.rules.get('min_monthly_fee', 0)
+        if isinstance(min_fee, dict):
+            return min_fee.get(self.location, 0) or 0
+        return min_fee or 0
+
+    def get_grace_period_months(self) -> int:
+        """
+        Get the grace period in months for payment verification.
+
+        Returns:
+            Number of grace period months
+        """
+        return self.rules.get('grace_period_months', 3)
 
     def check_all(self, row: List[str]) -> List[RedFlag]:
         """
@@ -325,14 +448,18 @@ class RedFlagChecker:
 
     def calculate_membership_age(self, row: List[str]) -> Optional[int]:
         """Calculate days since join date"""
-        join_date = self.parse_date(row[self.COL_JOIN_DATE])
+        # Use format-aware column lookup
+        join_idx = self.get_column_index('join_date')
+        join_date = self.parse_date(row[join_idx])
         if join_date:
             return (datetime.now() - join_date).days
         return None
 
     def is_membership_expired(self, row: List[str]) -> Optional[bool]:
         """Check if membership is expired"""
-        exp_date = self.parse_date(row[self.COL_EXP_DATE])
+        # Use format-aware column lookup
+        exp_idx = self.get_column_index('expiration_date')
+        exp_date = self.parse_date(row[exp_idx])
         if exp_date:
             return datetime.now() > exp_date
         return None
@@ -344,11 +471,13 @@ class RedFlagChecker:
         Returns total dollar amount at risk/missing
         """
         impact = 0.0
+        # Use format-aware column lookup
+        dues_idx = self.get_column_index('dues_amount')
 
         for flag in red_flags:
             if flag.flag_type in ['dues_low', 'dues_invalid']:
                 # Missing dues (expected - actual)
-                actual = self.parse_currency(row[self.COL_DUES_AMT]) or 0
+                actual = self.parse_currency(row[dues_idx]) or 0
                 if self.expected_dues > 0:
                     threshold = self.expected_dues * (self.rules.get('payment_threshold_percent', 90) / 100)
                     if actual < threshold:
@@ -370,10 +499,12 @@ class RedFlagChecker:
         """
         dues_impact = 0.0
         balance_impact = 0.0
+        # Use format-aware column lookup
+        dues_idx = self.get_column_index('dues_amount')
 
         for flag in red_flags:
             if flag.flag_type in ['dues_low', 'dues_invalid']:
-                actual = self.parse_currency(row[self.COL_DUES_AMT]) or 0
+                actual = self.parse_currency(row[dues_idx]) or 0
                 if self.expected_dues > 0:
                     threshold = self.expected_dues * (self.rules.get('payment_threshold_percent', 90) / 100)
                     if actual < threshold:
@@ -440,18 +571,19 @@ def get_membership_types(config: Dict[str, Any] = None) -> Dict[str, str]:
     }
 
 
-def create_checker(membership_type: str, location: str) -> RedFlagChecker:
+def create_checker(membership_type: str, location: str, format_type: str = 'old') -> RedFlagChecker:
     """
     Create a RedFlagChecker for the specified membership type and location
 
     Args:
         membership_type: Key from config (e.g., '1_year_paid_in_full')
         location: Key from config (e.g., 'bqe', 'greenpoint', 'lic')
+        format_type: 'old' for 17-column format, 'new' for 20-column format
 
     Returns:
         Configured RedFlagChecker instance
     """
-    return RedFlagChecker(membership_type, location)
+    return RedFlagChecker(membership_type, location, format_type=format_type)
 
 
 # Backwards compatibility
