@@ -184,18 +184,17 @@ def main():
         rules = type_config.get('rules', {})
         expected_dues = pricing.get(selected_location, 0) or 0
 
-        # Check if this is "All Membership Types"
-        if selected_membership_type == 'all_membership_types':
-            st.markdown("**All Membership Types Mode**")
+        # Check if this is "Split by Membership Type"
+        if selected_membership_type == 'split_by_type':
+            st.markdown("**Split by Membership Type Mode**")
             st.markdown("""
-            This mode processes all member types in a single file:
-            - **1MCORE**: 1 Month Paid in Full rules
-            - **1YRCORE**: 1 Year Paid in Full rules
-            - **3MCORE**: 3 Months Paid in Full rules
-            - **MTMCORE**: Month to Month rules
-            - **Other types**: Raw data (no rules applied)
+            This mode splits your file by member_type column:
+            - Creates **separate Excel files** for each member type found
+            - **NO rules applied** - raw data only
+            - **Fixes 1999 dates** → 2099 (gym software export issue)
+            - Shows verification summary to confirm all rows accounted for
 
-            Output: Multi-tab Excel with one tab per member type + summary.
+            Perfect for reviewing data before applying rules.
             """)
         else:
             st.markdown(f"**Rules for {type_name} at {locations[selected_location]}:**")
@@ -297,34 +296,42 @@ def main():
 
                 # Check audit type
                 is_mtm = current_type == 'month_to_month'
-                is_all_types = current_type == 'all_membership_types'
+                is_split_by_type = current_type == 'split_by_type'
 
                 # Process files
                 status_text.text(f"Processing files for {type_name} at {location_name}...")
 
-                if is_all_types:
-                    # All membership types audit: process each file with multi-type grouping
+                if is_split_by_type:
+                    # Split by membership type: split each file into separate raw data files
                     all_results = []
                     for uploaded_file in uploaded_files:
-                        result = engine.audit_all_membership_types_uploaded(uploaded_file, generate_report=True)
-                        all_results.append(result)
+                        # Split the file by member_type
+                        split_result = engine.split_file_by_membership_type_uploaded(uploaded_file)
 
-                    # Build results structure for all types
+                        if split_result['success']:
+                            # Generate the split files
+                            original_name = Path(split_result['filename']).stem
+                            split_files = engine.report_generator.create_split_type_files(
+                                header_row=split_result['header_row'],
+                                rows_by_type=split_result['rows_by_type'],
+                                base_filename=original_name
+                            )
+                            split_result['split_files'] = split_files
+
+                        all_results.append(split_result)
+
+                    # Build results structure for split
                     total_files = len(all_results)
                     successful_files = sum(1 for r in all_results if r['success'])
-                    total_records = sum(r.get('total_records', 0) for r in all_results if r['success'])
-                    total_flagged = sum(r.get('total_flagged', 0) for r in all_results if r['success'])
-                    total_financial_impact = sum(r.get('total_financial_impact', 0) for r in all_results if r['success'])
+                    total_records = sum(r.get('original_row_count', 0) for r in all_results if r['success'])
 
                     results = {
-                        'is_all_types': True,
+                        'is_split_by_type': True,
                         'is_mtm': False,
                         'total_files': total_files,
                         'successful_files': successful_files,
                         'failed_files': total_files - successful_files,
                         'total_records': total_records,
-                        'total_flagged': total_flagged,
-                        'total_financial_impact': total_financial_impact,
                         'file_results': all_results,
                         'consolidated_report_path': None
                     }
@@ -344,7 +351,7 @@ def main():
 
                     results = {
                         'is_mtm': True,
-                        'is_all_types': False,
+                        'is_split_by_type': False,
                         'total_files': total_files,
                         'successful_files': successful_files,
                         'failed_files': total_files - successful_files,
@@ -364,7 +371,7 @@ def main():
                         generate_consolidated=len(uploaded_files) > 1
                     )
                     results['is_mtm'] = False
-                    results['is_all_types'] = False
+                    results['is_split_by_type'] = False
 
                 # Store the settings used for this audit
                 results['audit_settings'] = {
@@ -392,11 +399,11 @@ def main():
             # Overall summary
             st.subheader("Overall Summary")
             is_mtm_result = results.get('is_mtm', False)
-            is_all_types_result = results.get('is_all_types', False)
+            is_split_by_type_result = results.get('is_split_by_type', False)
 
-            if is_all_types_result:
-                # All membership types summary (4 columns)
-                col1, col2, col3, col4 = st.columns(4)
+            if is_split_by_type_result:
+                # Split by membership type summary (2 columns)
+                col1, col2 = st.columns(2)
 
                 with col1:
                     display_metric_card(
@@ -412,57 +419,77 @@ def main():
                         color="#2196F3"
                     )
 
-                with col3:
-                    flagged_pct = (results['total_flagged'] / results['total_records'] * 100) if results['total_records'] > 0 else 0
-                    display_metric_card(
-                        "⚠️ Flagged",
-                        f"{results['total_flagged']:,} ({flagged_pct:.1f}%)",
-                        color="#FF9800"
-                    )
+                # Show verification summary for each file
+                for file_result in results['file_results']:
+                    if file_result['success']:
+                        st.markdown("---")
+                        st.subheader(f"📄 {file_result['filename']}")
 
-                with col4:
-                    display_metric_card(
-                        "Financial Impact",
-                        format_currency(results['total_financial_impact']),
-                        color="#F44336"
-                    )
+                        # Show verification summary
+                        original_count = file_result.get('original_row_count', 0)
+                        split_total = file_result.get('split_total', 0)
+                        verification_passed = file_result.get('verification_passed', False)
+                        type_counts = file_result.get('type_counts', {})
 
-                # Show member types breakdown
-                with st.expander("📊 **See Breakdown by Member Type**", expanded=True):
-                    for file_result in results['file_results']:
-                        if file_result['success']:
-                            type_results = file_result.get('type_results', {})
-                            member_types_found = file_result.get('member_types_found', [])
+                        # Original file row count (prominent)
+                        st.info(f"**Original file:** {original_count:,} rows")
 
-                            st.markdown(f"**Member Types Found:** {', '.join(member_types_found)}")
+                        # Split into table
+                        st.markdown("**Split into:**")
+                        type_data = []
+                        for member_type, count in sorted(type_counts.items(), key=lambda x: x[1], reverse=True):
+                            type_data.append({
+                                'Member Type': member_type,
+                                'Row Count': f"{count:,}"
+                            })
 
-                            # Create a table of member types
-                            type_data = []
-                            for member_type, type_result in type_results.items():
-                                config_key = type_result.get('config_key', 'Unknown')
-                                records = type_result.get('total_records', 0)
+                        if type_data:
+                            df = pd.DataFrame(type_data)
+                            st.dataframe(df, use_container_width=True, hide_index=True)
 
-                                if type_result.get('is_mtm'):
-                                    flagged = type_result.get('flagged_members', 0)
+                        # Total and verification
+                        if verification_passed:
+                            st.success(f"**TOTAL:** {split_total:,} rows ✓ MATCH")
+                        else:
+                            st.error(f"**TOTAL:** {split_total:,} rows ✗ MISMATCH (expected {original_count:,})")
+
+                        # Download buttons for split files
+                        split_files = file_result.get('split_files', {})
+                        if split_files:
+                            st.markdown("---")
+                            st.markdown("**📥 Download Split Files:**")
+
+                            # Create columns for download buttons
+                            num_files = len(split_files)
+                            cols = st.columns(min(num_files, 3))
+
+                            for idx, (member_type, file_info) in enumerate(sorted(split_files.items())):
+                                col_idx = idx % 3
+                                file_path = Path(file_info['file_path'])
+                                row_count = file_info['row_count']
+                                file_size = file_info['file_size']
+
+                                # Format file size
+                                if file_size < 1024:
+                                    size_str = f"{file_size} B"
+                                elif file_size < 1024 * 1024:
+                                    size_str = f"{file_size / 1024:.1f} KB"
                                 else:
-                                    flagged = type_result.get('flagged_count', 0)
+                                    size_str = f"{file_size / (1024 * 1024):.1f} MB"
 
-                                flag_pct = (flagged / records * 100) if records > 0 else 0
-                                has_rules = "Yes" if type_result.get('has_rules') else "No"
-
-                                type_data.append({
-                                    'Member Type': member_type,
-                                    'Config': config_key or 'Unknown',
-                                    'Records': records,
-                                    'Flagged': flagged,
-                                    'Flag %': f"{flag_pct:.1f}%",
-                                    'Rules Applied': has_rules
-                                })
-
-                            if type_data:
-                                import pandas as pd
-                                df = pd.DataFrame(type_data)
-                                st.dataframe(df, use_container_width=True, hide_index=True)
+                                with cols[col_idx]:
+                                    if file_path.exists():
+                                        with open(file_path, 'rb') as f:
+                                            st.download_button(
+                                                label=f"📄 {member_type}\n({row_count:,} rows, {size_str})",
+                                                data=f,
+                                                file_name=file_path.name,
+                                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                                key=f"split_{file_result['filename']}_{member_type}",
+                                                use_container_width=True
+                                            )
+                    else:
+                        st.error(f"❌ {file_result['filename']}: {file_result.get('error', 'Unknown error')}")
 
             elif is_mtm_result:
                 # MTM-specific summary (3 columns, no financial impact)
@@ -522,8 +549,8 @@ def main():
                         color="#F44336"
                     )
 
-            # Financial Impact Breakdown (only for non-MTM, non-all-types audits)
-            if not is_mtm_result and not is_all_types_result:
+            # Financial Impact Breakdown (only for non-MTM, non-split audits)
+            if not is_mtm_result and not is_split_by_type_result:
                 with st.expander("💡 **See Financial Impact Breakdown**", expanded=False):
                     st.markdown("### Where does the Financial Impact come from?")
 
@@ -561,206 +588,126 @@ def main():
 
             st.markdown("---")
 
-            # Per-file results
-            st.subheader("Individual File Results")
+            # Per-file results (skip for split_by_type as it's already shown above)
+            if not is_split_by_type_result:
+                st.subheader("Individual File Results")
 
-            for file_result in results['file_results']:
-                if not file_result['success']:
-                    st.error(f"❌ {file_result['filename']}: {file_result['error']}")
-                    continue
+                for file_result in results['file_results']:
+                    if not file_result['success']:
+                        st.error(f"❌ {file_result['filename']}: {file_result['error']}")
+                        continue
 
-                with st.expander(f"📄 {file_result['filename']}", expanded=True):
-                    if is_all_types_result:
-                        # All types file metrics
-                        col1, col2, col3, col4 = st.columns(4)
+                    with st.expander(f"📄 {file_result['filename']}", expanded=True):
+                        if is_mtm_result:
+                            # MTM-specific file metrics
+                            col1, col2, col3 = st.columns(3)
 
-                        with col1:
-                            st.metric("Total Records", f"{file_result['total_records']:,}")
+                            with col1:
+                                st.metric("Total Members", f"{file_result['total_members']:,}")
 
-                        with col2:
-                            flagged_pct = (file_result['total_flagged'] / file_result['total_records'] * 100) if file_result['total_records'] > 0 else 0
-                            flagged_color = "🔴" if file_result['total_flagged'] > 0 else "🟢"
-                            st.metric(
-                                f"{flagged_color} Flagged",
-                                f"{file_result['total_flagged']:,}",
-                                f"{flagged_pct:.1f}%"
-                            )
+                            with col2:
+                                flagged_pct = (file_result['flagged_members'] / file_result['total_members'] * 100) if file_result['total_members'] > 0 else 0
+                                flagged_color = "🔴" if file_result['flagged_members'] > 0 else "🟢"
+                                st.metric(
+                                    f"{flagged_color} Flagged Members",
+                                    f"{file_result['flagged_members']:,}",
+                                    f"{flagged_pct:.1f}%"
+                                )
 
-                        with col3:
-                            st.metric("Member Types", f"{len(file_result.get('member_types_found', []))}")
+                            with col3:
+                                st.metric("Total Transactions", f"{file_result['total_transactions']:,}")
 
-                        with col4:
-                            st.metric(
-                                "Financial Impact",
-                                format_currency(file_result.get('total_financial_impact', 0))
-                            )
+                            # Flagged Members with details
+                            member_results = file_result.get('member_results', {})
+                            flagged_members = {k: v for k, v in member_results.items() if v.get('has_flags')}
 
-                        # Download button for the multi-tab report
+                            if flagged_members:
+                                st.markdown("**⚠️ Flagged Members:**")
+
+                                # Limit display
+                                max_display = 20
+                                displayed = 0
+                                for member_key, member_data in list(flagged_members.items())[:max_display]:
+                                    member_name = f"{member_data['first_name']} {member_data['last_name']}"
+                                    member_number = member_data['member_number']
+
+                                    # Get flag summaries
+                                    flag_types = [f.flag_type for f in member_data.get('flags', [])]
+                                    missing_months = member_data.get('missing_months', [])
+
+                                    # Build display text
+                                    details = []
+                                    if missing_months:
+                                        details.append(f"Missing: {', '.join(missing_months[:3])}" + ("..." if len(missing_months) > 3 else ""))
+                                    if 'exp_year_wrong' in flag_types:
+                                        details.append("Exp Year")
+                                    if 'draft_date_too_far' in flag_types:
+                                        details.append("Draft Date")
+
+                                    detail_str = f" ({'; '.join(details)})" if details else ""
+
+                                    st.markdown(
+                                        f'<span style="background-color: #FFF3CD; color: #856404; padding: 0.25rem 0.5rem; border-radius: 0.25rem; margin: 0.25rem; display: inline-block;">'
+                                        f'{member_number}: {member_name}{detail_str}</span>',
+                                        unsafe_allow_html=True
+                                    )
+                                    displayed += 1
+
+                                remaining = len(flagged_members) - displayed
+                                if remaining > 0:
+                                    st.caption(f"... and {remaining} more")
+                        else:
+                            # Standard file metrics
+                            col1, col2, col3 = st.columns(3)
+
+                            with col1:
+                                st.metric("Total Records", f"{file_result['total_records']:,}")
+
+                            with col2:
+                                flagged_color = "🔴" if file_result['flagged_count'] > 0 else "🟢"
+                                st.metric(
+                                    f"{flagged_color} Flagged",
+                                    f"{file_result['flagged_count']:,}",
+                                    f"{file_result['flagged_percentage']:.1f}%"
+                                )
+
+                            with col3:
+                                st.metric(
+                                    "Financial Impact",
+                                    format_currency(file_result['total_financial_impact'])
+                                )
+
+                            # Flagged Member IDs
+                            if file_result.get('flagged_member_ids'):
+                                st.markdown("**⚠️ Flagged Member IDs:**")
+
+                                # Limit display
+                                max_display = 50
+                                member_ids = file_result['flagged_member_ids'][:max_display]
+                                remaining = len(file_result['flagged_member_ids']) - max_display
+
+                                # Display as chips/badges
+                                ids_html = " ".join([
+                                    f'<span style="background-color: #FFF3CD; color: #856404; padding: 0.25rem 0.5rem; border-radius: 0.25rem; margin: 0.25rem; display: inline-block;">{mid}</span>'
+                                    for mid in member_ids
+                                ])
+                                st.markdown(ids_html, unsafe_allow_html=True)
+
+                                if remaining > 0:
+                                    st.caption(f"... and {remaining} more")
+
+                        # Download button
                         if file_result.get('report_path'):
                             report_path = Path(file_result['report_path'])
                             if report_path.exists():
                                 with open(report_path, 'rb') as f:
                                     st.download_button(
-                                        label=f"📥 Download All Types Audit Report (Multi-Tab Excel)",
+                                        label=f"📥 Download Audit Report",
                                         data=f,
                                         file_name=report_path.name,
                                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                         use_container_width=True
                                     )
-
-                        # Individual member type files
-                        individual_files = file_result.get('individual_file_paths', {})
-                        if individual_files:
-                            with st.expander("📁 **Download Individual Member Type Files**", expanded=False):
-                                st.caption("Download audited files (with Notes) or raw files (for re-verification)")
-
-                                for member_type, file_paths in sorted(individual_files.items()):
-                                    st.markdown(f"**{member_type}**")
-                                    cols = st.columns(2)
-
-                                    # Audited file (with Notes) - only for known types
-                                    if 'audited' in file_paths:
-                                        audited_path = Path(file_paths['audited'])
-                                        if audited_path.exists():
-                                            with cols[0]:
-                                                with open(audited_path, 'rb') as f:
-                                                    st.download_button(
-                                                        label=f"📋 Audited (with Notes)",
-                                                        data=f,
-                                                        file_name=audited_path.name,
-                                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                                        key=f"audited_{file_result['filename']}_{member_type}",
-                                                        use_container_width=True
-                                                    )
-
-                                    # Raw file (for re-upload/re-verification)
-                                    if 'raw' in file_paths:
-                                        raw_path = Path(file_paths['raw'])
-                                        if raw_path.exists():
-                                            col_to_use = cols[1] if 'audited' in file_paths else cols[0]
-                                            with col_to_use:
-                                                with open(raw_path, 'rb') as f:
-                                                    st.download_button(
-                                                        label=f"📄 Raw (for re-verify)",
-                                                        data=f,
-                                                        file_name=raw_path.name,
-                                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                                        key=f"raw_{file_result['filename']}_{member_type}",
-                                                        use_container_width=True
-                                                    )
-
-                                    st.markdown("---")
-
-                    elif is_mtm_result:
-                        # MTM-specific file metrics
-                        col1, col2, col3 = st.columns(3)
-
-                        with col1:
-                            st.metric("Total Members", f"{file_result['total_members']:,}")
-
-                        with col2:
-                            flagged_pct = (file_result['flagged_members'] / file_result['total_members'] * 100) if file_result['total_members'] > 0 else 0
-                            flagged_color = "🔴" if file_result['flagged_members'] > 0 else "🟢"
-                            st.metric(
-                                f"{flagged_color} Flagged Members",
-                                f"{file_result['flagged_members']:,}",
-                                f"{flagged_pct:.1f}%"
-                            )
-
-                        with col3:
-                            st.metric("Total Transactions", f"{file_result['total_transactions']:,}")
-
-                        # Flagged Members with details
-                        member_results = file_result.get('member_results', {})
-                        flagged_members = {k: v for k, v in member_results.items() if v.get('has_flags')}
-
-                        if flagged_members:
-                            st.markdown("**⚠️ Flagged Members:**")
-
-                            # Limit display
-                            max_display = 20
-                            displayed = 0
-                            for member_key, member_data in list(flagged_members.items())[:max_display]:
-                                member_name = f"{member_data['first_name']} {member_data['last_name']}"
-                                member_number = member_data['member_number']
-
-                                # Get flag summaries
-                                flag_types = [f.flag_type for f in member_data.get('flags', [])]
-                                missing_months = member_data.get('missing_months', [])
-
-                                # Build display text
-                                details = []
-                                if missing_months:
-                                    details.append(f"Missing: {', '.join(missing_months[:3])}" + ("..." if len(missing_months) > 3 else ""))
-                                if 'exp_year_wrong' in flag_types:
-                                    details.append("Exp Year")
-                                if 'draft_date_too_far' in flag_types:
-                                    details.append("Draft Date")
-
-                                detail_str = f" ({'; '.join(details)})" if details else ""
-
-                                st.markdown(
-                                    f'<span style="background-color: #FFF3CD; color: #856404; padding: 0.25rem 0.5rem; border-radius: 0.25rem; margin: 0.25rem; display: inline-block;">'
-                                    f'{member_number}: {member_name}{detail_str}</span>',
-                                    unsafe_allow_html=True
-                                )
-                                displayed += 1
-
-                            remaining = len(flagged_members) - displayed
-                            if remaining > 0:
-                                st.caption(f"... and {remaining} more")
-                    else:
-                        # Standard file metrics
-                        col1, col2, col3 = st.columns(3)
-
-                        with col1:
-                            st.metric("Total Records", f"{file_result['total_records']:,}")
-
-                        with col2:
-                            flagged_color = "🔴" if file_result['flagged_count'] > 0 else "🟢"
-                            st.metric(
-                                f"{flagged_color} Flagged",
-                                f"{file_result['flagged_count']:,}",
-                                f"{file_result['flagged_percentage']:.1f}%"
-                            )
-
-                        with col3:
-                            st.metric(
-                                "Financial Impact",
-                                format_currency(file_result['total_financial_impact'])
-                            )
-
-                        # Flagged Member IDs
-                        if file_result.get('flagged_member_ids'):
-                            st.markdown("**⚠️ Flagged Member IDs:**")
-
-                            # Limit display
-                            max_display = 50
-                            member_ids = file_result['flagged_member_ids'][:max_display]
-                            remaining = len(file_result['flagged_member_ids']) - max_display
-
-                            # Display as chips/badges
-                            ids_html = " ".join([
-                                f'<span style="background-color: #FFF3CD; color: #856404; padding: 0.25rem 0.5rem; border-radius: 0.25rem; margin: 0.25rem; display: inline-block;">{mid}</span>'
-                                for mid in member_ids
-                            ])
-                            st.markdown(ids_html, unsafe_allow_html=True)
-
-                            if remaining > 0:
-                                st.caption(f"... and {remaining} more")
-
-                    # Download button
-                    if file_result.get('report_path'):
-                        report_path = Path(file_result['report_path'])
-                        if report_path.exists():
-                            with open(report_path, 'rb') as f:
-                                st.download_button(
-                                    label=f"📥 Download Audit Report",
-                                    data=f,
-                                    file_name=report_path.name,
-                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                    use_container_width=True
-                                )
 
             # Consolidated report download
             if results.get('consolidated_report_path') and len(uploaded_files) > 1:

@@ -61,9 +61,19 @@ class AuditEngine:
         """
         audit_results = []
 
-        for row in data_rows:
-            # Check for red flags
+        for i, row in enumerate(data_rows):
+            # Get adjacent rows for payment verification
+            prev_row = data_rows[i-1] if i > 0 else None
+            next_row = data_rows[i+1] if i < len(data_rows) - 1 else None
+
+            # Run standard checks
             red_flags = self.checker.check_all(row)
+
+            # Check for charge without matching payment (new format only)
+            if self.checker.format_type == 'new':
+                needs_verify_flag = self.checker.check_charge_needs_verification(row, prev_row, next_row)
+                if needs_verify_flag:
+                    red_flags.append(needs_verify_flag)
 
             # Calculate additional context
             membership_age = self.checker.calculate_membership_age(row)
@@ -387,6 +397,127 @@ class AuditEngine:
             member_type = row[member_type_idx].strip().upper()
             return member_type == 'MTMCORE'
         return False
+
+    def audit_1mcore_transactions(
+        self,
+        data_rows: List[List[str]],
+        expected_price: float
+    ) -> Dict[str, Any]:
+        """
+        Audit 1-Month Paid in Full (1MCORE) transactions.
+
+        Groups transactions by member and checks:
+        1. Payment balance (charges vs payments)
+        2. Price match (each charge against expected price)
+
+        Args:
+            data_rows: List of transaction rows (new format)
+            expected_price: Expected price for 1MCORE at this location
+
+        Returns:
+            Dictionary with member-level audit results
+        """
+        from .red_flags import RedFlag
+
+        cols = self.checker.NEW_FORMAT_COLUMNS
+
+        # Group transactions by member_number
+        member_transactions = defaultdict(list)
+        for row in data_rows:
+            member_number = row[cols['member_number']].strip() if cols['member_number'] < len(row) else ''
+            if member_number:
+                member_transactions[member_number].append(row)
+
+        member_results = {}
+
+        for member_number, transactions in member_transactions.items():
+            first_row = transactions[0]
+
+            # Get member info
+            first_name = first_row[cols['first_name']] if cols['first_name'] < len(first_row) else ''
+            last_name = first_row[cols['last_name']] if cols['last_name'] < len(first_row) else ''
+
+            all_flags = []
+            total_amount = 0.0
+            price_mismatches = []
+            low_amounts = []
+
+            # Calculate 90% threshold for low amount detection
+            threshold_percent = 90
+            min_expected = expected_price * (threshold_percent / 100) if expected_price > 0 else 0
+
+            # Process each transaction
+            for row in transactions:
+                amount_str = row[cols['amount']] if cols['amount'] < len(row) else ''
+                amount = self._parse_currency(amount_str)
+
+                if amount is not None:
+                    total_amount += amount
+                    abs_amount = abs(amount)
+
+                    # Check if amount (charge or payment) is less than 90% of expected
+                    if expected_price > 0 and abs_amount < min_expected:
+                        low_amounts.append(amount)
+
+                    # Check for price mismatch on charges (positive amounts)
+                    if amount > 0 and expected_price > 0:
+                        # Allow small tolerance (e.g., $0.01 for rounding)
+                        if abs(amount - expected_price) > 0.01:
+                            price_mismatches.append(amount)
+
+            # Flag if unpaid balance (charges exceed payments)
+            if total_amount > 0.01:  # Small tolerance for floating point
+                all_flags.append(RedFlag(
+                    "unpaid_balance",
+                    f"Unpaid balance: ${total_amount:.2f} (charges exceed payments)",
+                    total_amount
+                ))
+
+            # Flag low amounts (less than 90% of expected price)
+            for low_amount in low_amounts:
+                abs_amt = abs(low_amount)
+                txn_type = "Charge" if low_amount > 0 else "Payment"
+                all_flags.append(RedFlag(
+                    "low_amount",
+                    f"{txn_type} ${abs_amt:.2f} is less than {threshold_percent}% of expected ${expected_price:.2f} (min ${min_expected:.2f})",
+                    low_amount
+                ))
+
+            # Flag price mismatches
+            for mismatch_amount in price_mismatches:
+                all_flags.append(RedFlag(
+                    "price_mismatch",
+                    f"Charge ${mismatch_amount:.2f} doesn't match expected ${expected_price:.2f} - possible wrong membership type",
+                    mismatch_amount
+                ))
+
+            # Run basic date/expiration checks on first row
+            basic_flags = self.checker.check_all(first_row)
+            # Filter out any existing date_invalid flags since we're handling dates better now
+            basic_flags = [f for f in basic_flags if f.flag_type != 'date_invalid' or self._parse_date(first_row[cols['join_date']]) is None]
+            all_flags.extend(basic_flags)
+
+            member_results[member_number] = {
+                'member_number': member_number,
+                'first_name': first_name,
+                'last_name': last_name,
+                'transactions': transactions,
+                'transaction_count': len(transactions),
+                'total_amount': total_amount,
+                'flags': all_flags,
+                'has_flags': len(all_flags) > 0,
+                'flag_count': len(all_flags),
+                'price_mismatches': price_mismatches,
+                'low_amounts': low_amounts,
+                'first_row': first_row  # Keep for report generation
+            }
+
+        return {
+            'member_results': member_results,
+            'total_members': len(member_results),
+            'flagged_members': sum(1 for r in member_results.values() if r['has_flags']),
+            'total_transactions': sum(len(r['transactions']) for r in member_results.values())
+        }
 
     def _check_basic_mtm_rules(self, row: List[str]) -> List:
         """
@@ -795,8 +926,60 @@ class AuditEngine:
         for member_type, rows in rows_by_type.items():
             config_key = member_type_mapping.get(member_type)
 
-            if config_key and config_key != 'month_to_month':
-                # Known non-MTM type - apply standard audit rules
+            if config_key == '1_month_paid_in_full':
+                # 1MCORE - use transaction-based audit with payment balance check
+                type_checker = create_checker(config_key, self.location, format_type='new')
+                self.checker = type_checker
+                expected_price = type_checker.expected_dues
+
+                onemcore_results = self.audit_1mcore_transactions(rows, expected_price)
+
+                # Build audit_results from member_results for consistent reporting
+                audit_results = []
+                for member_data in onemcore_results['member_results'].values():
+                    # Create an audit result for each member (using first row as representative)
+                    first_row = member_data['first_row']
+                    red_flags = member_data['flags']
+
+                    result = {
+                        'row_data': first_row,
+                        'red_flags': red_flags,
+                        'has_flags': member_data['has_flags'],
+                        'flag_count': member_data['flag_count'],
+                        'membership_age': type_checker.calculate_membership_age(first_row),
+                        'is_expired': type_checker.is_membership_expired(first_row),
+                        'financial_impact': member_data['total_amount'] if member_data['total_amount'] > 0 else 0,
+                        'dues_impact': 0,
+                        'balance_impact': member_data['total_amount'] if member_data['total_amount'] > 0 else 0,
+                        'member_id': member_data['member_number'],
+                        'member_name': f"{member_data['first_name']} {member_data['last_name']}"
+                    }
+                    audit_results.append(result)
+
+                flagged_count = onemcore_results['flagged_members']
+                type_financial_impact = sum(r['financial_impact'] for r in audit_results)
+
+                type_results[member_type] = {
+                    'config_key': config_key,
+                    'is_known_type': True,
+                    'has_rules': True,
+                    'is_1mcore': True,
+                    'total_records': len(rows),
+                    'total_members': onemcore_results['total_members'],
+                    'flagged_count': flagged_count,
+                    'flagged_percentage': (flagged_count / onemcore_results['total_members'] * 100) if onemcore_results['total_members'] > 0 else 0,
+                    'financial_impact': type_financial_impact,
+                    'audit_results': audit_results,
+                    'member_results': onemcore_results['member_results'],
+                    'rows': rows
+                }
+
+                total_records += len(rows)
+                total_flagged += flagged_count
+                total_financial_impact += type_financial_impact
+
+            elif config_key and config_key != 'month_to_month':
+                # Known non-MTM type (not 1MCORE) - apply standard audit rules
                 type_checker = create_checker(config_key, self.location, format_type='new')
                 audit_results = []
 
@@ -920,4 +1103,221 @@ class AuditEngine:
             'member_types_found': list(rows_by_type.keys()),
             'report_path': report_path,
             'individual_file_paths': individual_file_paths
+        }
+
+    def _clean_date_format(self, date_str: str) -> str:
+        """
+        Clean date string: remove timestamp and return M/D/YYYY format.
+        Does NOT change the year - just cleans the format.
+
+        Args:
+            date_str: Date string in various formats
+
+        Returns:
+            Clean date string in M/D/YYYY format, or original if unparseable
+        """
+        if not date_str or not date_str.strip():
+            return date_str
+
+        date_str = date_str.strip()
+
+        # Skip if it looks like 'nan' or empty
+        if date_str.lower() in ('nan', 'nat', 'none', ''):
+            return ''
+
+        try:
+            parsed_date = None
+
+            # Try multiple date formats
+            date_formats = [
+                '%Y-%m-%d %H:%M:%S',  # 1999-12-31 00:00:00 (pandas default)
+                '%Y-%m-%d',            # 1999-12-31
+                '%m/%d/%Y %H:%M:%S',   # 12/31/1999 00:00:00
+                '%m/%d/%Y',            # 12/31/1999
+                '%m/%d/%y',            # 12/31/99
+            ]
+
+            for fmt in date_formats:
+                try:
+                    parsed_date = datetime.strptime(date_str, fmt)
+                    break
+                except ValueError:
+                    continue
+
+            if parsed_date is None:
+                return date_str  # Couldn't parse, return original
+
+            # Return in clean M/D/YYYY format (no timestamp)
+            return f"{parsed_date.month}/{parsed_date.day}/{parsed_date.year}"
+
+        except Exception:
+            return date_str
+
+    def _fix_1999_year_in_date(self, date_str: str) -> str:
+        """
+        Fix dates where year is 1999 (gym software exports 2099 as 1999).
+        Also removes any timestamp component and returns clean M/D/YYYY format.
+
+        Args:
+            date_str: Date string in various formats (M/D/YY, YYYY-MM-DD HH:MM:SS, etc.)
+
+        Returns:
+            Fixed date string in M/D/YYYY format without timestamp, or original if unparseable
+        """
+        if not date_str or not date_str.strip():
+            return date_str
+
+        date_str = date_str.strip()
+
+        # Skip if it looks like 'nan' or empty
+        if date_str.lower() in ('nan', 'nat', 'none', ''):
+            return ''
+
+        try:
+            parsed_date = None
+
+            # Try multiple date formats
+            date_formats = [
+                '%Y-%m-%d %H:%M:%S',  # 1999-12-31 00:00:00 (pandas default)
+                '%Y-%m-%d',            # 1999-12-31
+                '%m/%d/%Y %H:%M:%S',   # 12/31/1999 00:00:00
+                '%m/%d/%Y',            # 12/31/1999
+                '%m/%d/%y',            # 12/31/99
+            ]
+
+            for fmt in date_formats:
+                try:
+                    parsed_date = datetime.strptime(date_str, fmt)
+                    break
+                except ValueError:
+                    continue
+
+            if parsed_date is None:
+                return date_str  # Couldn't parse, return original
+
+            # Fix 1999 -> 2099
+            if parsed_date.year == 1999:
+                parsed_date = parsed_date.replace(year=2099)
+
+            # Return in clean M/D/YYYY format (no timestamp)
+            # Use manual formatting for cross-platform compatibility (%-m doesn't work on Windows)
+            return f"{parsed_date.month}/{parsed_date.day}/{parsed_date.year}"
+
+        except Exception:
+            return date_str
+
+    def split_file_by_membership_type_uploaded(self, uploaded_file) -> Dict[str, Any]:
+        """
+        Split an uploaded file by member_type column into separate raw data files.
+        No rules applied - just splits data and fixes 1999->2099 dates.
+
+        Args:
+            uploaded_file: Streamlit UploadedFile object
+
+        Returns:
+            Dictionary with split data, counts, and verification info
+        """
+        try:
+            file_data = self.file_reader.read_and_validate_upload(uploaded_file)
+        except Exception as e:
+            return {
+                'success': False,
+                'error': str(e),
+                'filename': uploaded_file.name if hasattr(uploaded_file, 'name') else 'Unknown'
+            }
+
+        if not file_data['is_valid']:
+            return {
+                'success': False,
+                'error': file_data['error'],
+                'filename': file_data['filename']
+            }
+
+        # This requires new format (20-column) for member_type column
+        detected_format = file_data.get('format_type', 'old')
+        if detected_format != 'new':
+            return {
+                'success': False,
+                'error': "Split by membership type requires new format (20-column) data with member_type column",
+                'filename': file_data['filename']
+            }
+
+        # Column indices in new format
+        MEMBER_TYPE_COL = 9        # member_type
+        TRANSACTION_DATE_COL = 3   # transaction_date
+        JOIN_DATE_COL = 7          # join_date
+        EXPIRATION_DATE_COL = 8    # expiration_date
+        START_DRAFT_COL = 15       # start_draft
+        END_DRAFT_COL = 16         # end_draft
+        CONTRACT_DATE_COL = 17     # contract_date
+
+        # Columns that need 1999->2099 fix (future dates that got exported as 1999)
+        FIX_1999_COLS = [EXPIRATION_DATE_COL, START_DRAFT_COL, END_DRAFT_COL, CONTRACT_DATE_COL]
+
+        # All date columns that need timestamp removal
+        ALL_DATE_COLS = [TRANSACTION_DATE_COL, JOIN_DATE_COL, EXPIRATION_DATE_COL, START_DRAFT_COL, END_DRAFT_COL, CONTRACT_DATE_COL]
+
+        # Step 1: Count original rows
+        data_rows = file_data['data_rows']
+        original_row_count = len(data_rows)
+
+        # Step 2: Initialize grouping dict
+        rows_by_type = defaultdict(list)
+        processed_count = 0
+
+        # Step 3: Process each row
+        for row in data_rows:
+            # Get member_type from column 9
+            if len(row) > MEMBER_TYPE_COL:
+                member_type = row[MEMBER_TYPE_COL].strip().upper()
+                if not member_type:
+                    member_type = 'UNKNOWN'
+            else:
+                member_type = 'UNKNOWN'
+
+            # Create a copy of the row for modification
+            fixed_row = list(row)
+
+            # Clean all date columns (remove timestamps)
+            for col_idx in ALL_DATE_COLS:
+                if len(fixed_row) > col_idx:
+                    if col_idx in FIX_1999_COLS:
+                        # Fix 1999->2099 AND clean timestamp
+                        fixed_row[col_idx] = self._fix_1999_year_in_date(str(fixed_row[col_idx]))
+                    else:
+                        # Just clean timestamp
+                        fixed_row[col_idx] = self._clean_date_format(str(fixed_row[col_idx]))
+
+            # Add row to appropriate group
+            rows_by_type[member_type].append(fixed_row)
+            processed_count += 1
+
+        # Step 4: Verify data integrity
+        split_total = sum(len(rows) for rows in rows_by_type.values())
+
+        if split_total != original_row_count:
+            return {
+                'success': False,
+                'error': f"DATA INTEGRITY ERROR: Original={original_row_count}, Split total={split_total}, Missing={original_row_count - split_total} rows",
+                'filename': file_data['filename'],
+                'original_row_count': original_row_count,
+                'split_total': split_total
+            }
+
+        # Step 5: Build counts per type for display
+        type_counts = {}
+        for member_type, rows in rows_by_type.items():
+            type_counts[member_type] = len(rows)
+
+        return {
+            'success': True,
+            'filename': file_data['filename'],
+            'format_type': detected_format,
+            'header_row': file_data['header'],
+            'original_row_count': original_row_count,
+            'split_total': split_total,
+            'rows_by_type': dict(rows_by_type),  # Convert defaultdict to regular dict
+            'type_counts': type_counts,
+            'member_types_found': list(rows_by_type.keys()),
+            'verification_passed': split_total == original_row_count
         }

@@ -43,3 +43,6 @@ Thumbs.db
 # Environment variables
 .env
 .env.local
+
+# Documentation folder for claude compact/markdown files
+Documentation/

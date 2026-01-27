@@ -106,13 +106,13 @@
       "enabled": true,
       "notes": "Pricing TBD - will be updated later"
     },
-    "all_membership_types": {
-      "name": "All Membership Types",
-      "description": "Process all membership types and generate grouped report",
+    "split_by_type": {
+      "name": "Split by Membership Type (Raw Data)",
+      "description": "Split file into separate files by member_type - no rules applied",
       "pricing": {},
       "rules": {},
       "enabled": true,
-      "notes": "Groups data by member_type column and applies appropriate rules per type"
+      "notes": "Splits data by member_type column, fixes 1999->2099 dates, outputs raw data files per type"
     }
   },
   "member_type_mapping": {

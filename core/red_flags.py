@@ -148,13 +148,24 @@ class RedFlagChecker:
 
     @staticmethod
     def parse_date(date_str: str) -> Optional[datetime]:
-        """Parse date in M/D/YY format"""
+        """Parse date in various formats (M/D/YY or M/D/YYYY)"""
         if not date_str or not date_str.strip():
             return None
-        try:
-            return datetime.strptime(date_str.strip(), '%m/%d/%y')
-        except:
+        date_str = date_str.strip()
+        if date_str.lower() in ('nan', 'nat', 'none', ''):
             return None
+
+        formats = [
+            '%m/%d/%Y',  # 1/15/2025 (4-digit year)
+            '%m/%d/%y',  # 1/15/25 (2-digit year)
+            '%Y-%m-%d',  # 2025-01-15 (ISO format)
+        ]
+        for fmt in formats:
+            try:
+                return datetime.strptime(date_str, fmt)
+            except ValueError:
+                continue
+        return None
 
     @staticmethod
     def parse_currency(currency_str: str) -> Optional[float]:
@@ -395,6 +406,107 @@ class RedFlagChecker:
 
         return False, None
 
+    def check_transaction_amount(self, row: List[str]) -> Tuple[bool, Optional[RedFlag]]:
+        """
+        Check if transaction amount is less than 90% of expected price.
+        Applies to both charges (positive) and payments (negative).
+        Only runs for new format files with 'amount' column.
+        """
+        if self.format_type != 'new':
+            return False, None
+
+        if self.expected_dues == 0:
+            return False, None  # No price configured for this location
+
+        # Get amount column (index 6 in new format)
+        amount_idx = self.get_column_index('amount')
+        if amount_idx < 0 or amount_idx >= len(row):
+            return False, None
+
+        amount = self.parse_currency(row[amount_idx])
+        if amount is None:
+            return False, None
+
+        # Calculate 90% threshold
+        threshold_percent = self.rules.get('payment_threshold_percent', 90)
+        min_expected = self.expected_dues * (threshold_percent / 100)
+
+        abs_amount = abs(amount)
+
+        # Check if amount is less than threshold (including $0)
+        if abs_amount < min_expected:
+            if amount == 0:
+                txn_type = "Transaction"
+            else:
+                txn_type = "Charge" if amount > 0 else "Payment"
+            return True, RedFlag(
+                "low_amount",
+                f"{txn_type} ${abs_amount:.2f} is less than {threshold_percent}% of expected ${self.expected_dues:.2f} (min ${min_expected:.2f})",
+                amount
+            )
+
+        return False, None
+
+    def check_charge_needs_verification(
+        self,
+        row: List[str],
+        prev_row: Optional[List[str]],
+        next_row: Optional[List[str]]
+    ) -> Optional[RedFlag]:
+        """Check if charge passes threshold but has no matching payment in adjacent rows."""
+        if self.format_type != 'new':
+            return None
+
+        amount_idx = self.get_column_index('amount')
+        member_idx = self.get_column_index('member_number')
+
+        if amount_idx < 0 or amount_idx >= len(row):
+            return None
+
+        amount = self.parse_currency(row[amount_idx])
+        if amount is None or amount <= 0:
+            return None
+
+        # Only check charges that PASS the threshold
+        threshold_percent = self.rules.get('payment_threshold_percent', 90)
+        min_expected = self.expected_dues * (threshold_percent / 100)
+        if amount < min_expected:
+            return None
+
+        # Get current row's member_number for comparison
+        current_member = row[member_idx].strip() if member_idx >= 0 and member_idx < len(row) else None
+
+        # Check adjacent rows for matching payment FROM SAME MEMBER
+        def get_adjacent_amount(adj_row):
+            if adj_row is None or amount_idx >= len(adj_row):
+                return None
+            # Check if same member
+            if current_member and member_idx >= 0 and member_idx < len(adj_row):
+                adj_member = adj_row[member_idx].strip()
+                if adj_member != current_member:
+                    return None  # Different member, don't count as matching
+            return self.parse_currency(adj_row[amount_idx])
+
+        prev_amount = get_adjacent_amount(prev_row)
+        next_amount = get_adjacent_amount(next_row)
+        tolerance = 1.0
+
+        has_matching_payment = False
+        if prev_amount is not None and prev_amount < 0:
+            if abs(amount + prev_amount) <= tolerance:
+                has_matching_payment = True
+        if next_amount is not None and next_amount < 0:
+            if abs(amount + next_amount) <= tolerance:
+                has_matching_payment = True
+
+        if not has_matching_payment:
+            return RedFlag(
+                "needs_verification",
+                f"Charge ${amount:.2f} - no matching payment in adjacent rows, verify in gym software",
+                amount
+            )
+        return None
+
     def get_min_monthly_fee(self) -> float:
         """
         Get the minimum monthly fee for the current location.
@@ -437,6 +549,7 @@ class RedFlagChecker:
             self.check_balance,
             self.check_end_draft_date,
             self.check_draft_date,
+            self.check_transaction_amount,  # Transaction amount check for new format files
         ]
 
         for check_func in checks:

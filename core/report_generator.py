@@ -1454,3 +1454,70 @@ class AuditReportGenerator:
                 individual_files[member_type]['raw'] = str(output_path)
 
         return individual_files
+
+    def create_split_type_files(
+        self,
+        header_row: List[str],
+        rows_by_type: Dict[str, List[List[str]]],
+        base_filename: str
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Create separate raw Excel files for each member_type.
+        NO rules applied, NO highlighting, NO Notes column - pure raw data output.
+
+        Args:
+            header_row: Column headers from original file
+            rows_by_type: Dictionary mapping member_type to list of rows
+            base_filename: Base name for output files (without extension)
+
+        Returns:
+            Dict mapping member_type to dict with 'file_path', 'row_count', 'file_size'
+        """
+        split_files = {}
+
+        for member_type, rows in rows_by_type.items():
+            if not rows:
+                continue
+
+            # Sanitize member_type for filename
+            safe_type = member_type.replace('/', '-').replace('\\', '-').replace('*', '').replace('?', '').replace('[', '').replace(']', '').replace(':', '-')
+            if not safe_type:
+                safe_type = 'UNKNOWN'
+
+            # Create workbook
+            wb = Workbook()
+            sheet = wb.active
+            sheet.title = "Data"
+
+            # Write header row with basic formatting
+            for col_idx, header_text in enumerate(header_row, start=1):
+                cell = sheet.cell(row=1, column=col_idx, value=header_text)
+                cell.font = self.BOLD_FONT
+                cell.fill = self.HEADER_FILL
+
+            # Write data rows - no highlighting, no modifications
+            excel_row = 2
+            for row in rows:
+                for col_idx, value in enumerate(row, start=1):
+                    sheet.cell(row=excel_row, column=col_idx, value=value)
+                excel_row += 1
+
+            # Auto-adjust column widths
+            self._auto_adjust_column_widths(sheet)
+
+            # Generate output filename
+            output_filename = f"{base_filename}_{safe_type}.xlsx"
+            output_path = self.output_folder / output_filename
+            wb.save(output_path)
+
+            # Get file size
+            file_size = output_path.stat().st_size
+
+            split_files[member_type] = {
+                'file_path': str(output_path),
+                'row_count': len(rows),
+                'file_size': file_size,
+                'filename': output_filename
+            }
+
+        return split_files
