@@ -8,6 +8,8 @@ import streamlit as st
 import json
 import pandas as pd
 from pathlib import Path
+from io import BytesIO
+import zipfile
 import plotly.express as px
 import plotly.graph_objects as go
 
@@ -120,12 +122,17 @@ def main():
         - Cycle value must match expected (0 for PIF memberships)
         - Balance must be $0.00
 
-        **Month to Month:**
-        - Expiration year should be 2099
-        - Cycle should be 1
-        - Draft date within 3 months of join date
-        - End draft year should be 2099
-        - Balance must be $0.00
+        **Month to Month (MTMCORE):**
+        - **Charge/Payment Matching**: Each charge should have a matching payment
+        - **Enrollment Fee**: New members (joined after 1/1/2025) should have $50 enrollment fee
+        - **Initial Payment**: First payment should be ~$180+ (prorated + 2 months)
+        - **Monthly Payments**: After initial period, monthly payments of $59.99+ required
+        - **Date Rules**: Expiration year = 2099, End draft year = 2099
+        - **Draft Date**: Within 3 months of join date
+
+        *Member Types:*
+        - **New**: Has enrollment fee transaction → coverage starts after initial payment period
+        - **Existing**: No enrollment fee → coverage starts at report start date (1/1/2025)
 
         **Yellow rows in your Excel reports = accounts that need attention!**
         """)
@@ -182,7 +189,13 @@ def main():
         type_name = type_config.get('name', selected_membership_type)
         pricing = type_config.get('pricing', {})
         rules = type_config.get('rules', {})
-        expected_dues = pricing.get(selected_location, 0) or 0
+
+        # Handle both simple pricing (number) and nested pricing (dict with monthly_rate etc)
+        location_pricing = pricing.get(selected_location, 0)
+        if isinstance(location_pricing, dict):
+            expected_dues = location_pricing.get('monthly_rate', 0) or 0
+        else:
+            expected_dues = location_pricing or 0
 
         # Check if this is "Split by Membership Type"
         if selected_membership_type == 'split_by_type':
@@ -233,15 +246,30 @@ def main():
                 st.markdown(f"- ⚠️ End draft year = {rules['expected_end_draft_year']}")
 
             # MTM-specific rules
-            if rules.get('min_monthly_fee'):
-                min_fee = rules['min_monthly_fee']
-                if isinstance(min_fee, dict):
-                    min_fee = min_fee.get(selected_location, 0) or 0
-                if min_fee > 0:
-                    st.markdown(f"- ⚠️ Min monthly payment ≥ ${min_fee:.2f}")
+            if rules.get('check_charge_payment_matching'):
+                st.markdown("- ⚠️ Charge/payment matching")
 
-            if rules.get('grace_period_months'):
-                st.markdown(f"- ⚠️ Grace period: {rules['grace_period_months']} months")
+            if rules.get('check_enrollment_fee'):
+                # Get enrollment fee from pricing
+                mtm_pricing = pricing.get(selected_location, {})
+                if isinstance(mtm_pricing, dict):
+                    enroll_fee = mtm_pricing.get('enrollment_fee', 50.00)
+                    st.markdown(f"- ⚠️ Enrollment fee ${enroll_fee:.2f} (new members)")
+
+            if rules.get('initial_payment_threshold'):
+                threshold = rules.get('initial_payment_threshold', 150)
+                covers = rules.get('initial_payment_covers_months', 3)
+                st.markdown(f"- ⚠️ Initial payment ≥ ${threshold:.2f} (covers {covers} months)")
+
+            if rules.get('check_monthly_payments'):
+                # Get monthly rate from pricing
+                mtm_pricing = pricing.get(selected_location, {})
+                if isinstance(mtm_pricing, dict):
+                    monthly_rate = mtm_pricing.get('monthly_rate', 59.99)
+                    st.markdown(f"- ⚠️ Monthly payment ≥ ${monthly_rate:.2f}")
+
+            if rules.get('report_start_date'):
+                st.markdown(f"- ⚠️ Report start: {rules['report_start_date']}")
 
         st.markdown("---")
         st.caption(f"Version {settings.get('app', {}).get('version', '1.0.0')}")
@@ -304,18 +332,40 @@ def main():
                 if is_split_by_type:
                     # Split by membership type: split each file into separate raw data files
                     all_results = []
-                    for uploaded_file in uploaded_files:
-                        # Split the file by member_type
+                    total_uploaded = len(uploaded_files)
+
+                    for file_idx, uploaded_file in enumerate(uploaded_files):
+                        # Phase 1: Reading and parsing file
+                        file_base_pct = int((file_idx / total_uploaded) * 100)
+                        file_chunk = int(100 / total_uploaded)
+                        status_text.text(f"Reading {uploaded_file.name}...")
+                        progress_bar.progress(min(file_base_pct + int(file_chunk * 0.1), 99))
+
                         split_result = engine.split_file_by_membership_type_uploaded(uploaded_file)
 
                         if split_result['success']:
-                            # Generate the split files
+                            rows_by_type = split_result['rows_by_type']
+                            num_types = len(rows_by_type)
                             original_name = Path(split_result['filename']).stem
-                            split_files = engine.report_generator.create_split_type_files(
-                                header_row=split_result['header_row'],
-                                rows_by_type=split_result['rows_by_type'],
-                                base_filename=original_name
-                            )
+
+                            # Phase 2: Generate split files one type at a time with progress
+                            status_text.text(f"Splitting {uploaded_file.name} into {num_types} member types...")
+                            progress_bar.progress(min(file_base_pct + int(file_chunk * 0.3), 99))
+
+                            split_files = {}
+                            for type_idx, (member_type, rows) in enumerate(rows_by_type.items()):
+                                pct = file_base_pct + int(file_chunk * (0.3 + 0.7 * (type_idx + 1) / num_types))
+                                status_text.text(f"Writing {member_type} ({len(rows):,} rows)...")
+                                progress_bar.progress(min(pct, 99))
+
+                                # Generate one type at a time
+                                single_type_files = engine.report_generator.create_split_type_files(
+                                    header_row=split_result['header_row'],
+                                    rows_by_type={member_type: rows},
+                                    base_filename=original_name
+                                )
+                                split_files.update(single_type_files)
+
                             split_result['split_files'] = split_files
 
                         all_results.append(split_result)
@@ -488,6 +538,26 @@ def main():
                                                 key=f"split_{file_result['filename']}_{member_type}",
                                                 use_container_width=True
                                             )
+
+                            # Download All as ZIP button
+                            st.markdown("---")
+                            zip_buffer = BytesIO()
+                            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+                                for member_type, file_info in sorted(split_files.items()):
+                                    fp = Path(file_info['file_path'])
+                                    if fp.exists():
+                                        zf.write(fp, fp.name)
+                            zip_buffer.seek(0)
+
+                            base_name = Path(file_result['filename']).stem
+                            st.download_button(
+                                label=f"📦 Download All ({num_files} files) as ZIP",
+                                data=zip_buffer,
+                                file_name=f"{base_name}_all_split_files.zip",
+                                mime="application/zip",
+                                key=f"zip_all_{file_result['filename']}",
+                                use_container_width=True
+                            )
                     else:
                         st.error(f"❌ {file_result['filename']}: {file_result.get('error', 'Unknown error')}")
 

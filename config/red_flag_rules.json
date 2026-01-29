@@ -15,7 +15,7 @@
   },
   "membership_types": {
     "1_year_paid_in_full": {
-      "name": "1 Year Paid in Full",
+      "name": "1YRCORE - 1 Year Paid in Full",
       "description": "Annual membership paid upfront",
       "pricing": {
         "bqe": 725,
@@ -36,7 +36,7 @@
       "enabled": true
     },
     "3_months_paid_in_full": {
-      "name": "3 Months Paid in Full",
+      "name": "3MCORE - 3 Months Paid in Full",
       "description": "Quarterly membership paid upfront",
       "pricing": {
         "bqe": 440,
@@ -57,7 +57,7 @@
       "enabled": true
     },
     "1_month_paid_in_full": {
-      "name": "1 Month Paid in Full",
+      "name": "1MCORE - 1 Month Paid in Full",
       "description": "Monthly membership paid upfront",
       "pricing": {
         "bqe": 240,
@@ -77,34 +77,68 @@
       },
       "enabled": true
     },
-    "month_to_month": {
-      "name": "Month to Month",
-      "description": "Recurring monthly membership",
-      "member_type_identifier": "MTMCORE",
+    "1_year_lux_paid_in_full": {
+      "name": "1YRLUX - 1 Year Lux Paid in Full",
+      "description": "Annual lux membership paid upfront",
       "pricing": {
-        "bqe": null,
-        "greenpoint": null,
-        "lic": null
+        "bqe": 1500,
+        "greenpoint": 1500,
+        "lic": 1500
       },
       "rules": {
-        "expected_exp_year": 2099,
+        "date_diff_max_days": 365,
+        "date_rule_type": "max_only",
+        "payment_threshold_percent": 90,
         "check_cycle": false,
-        "expected_cycle": 1,
-        "draft_date_max_months_from_join": 3,
-        "expected_end_draft_year": 2099,
-        "min_monthly_fee": {
-          "bqe": 59.99,
-          "greenpoint": 59.99,
-          "lic": 59.99
-        },
-        "grace_period_months": 3,
+        "expected_cycle": 0,
         "check_balance": false,
         "expected_balance": 0,
         "check_pay_type": false,
-        "check_monthly_payments": false
+        "check_end_draft": false
       },
-      "enabled": true,
-      "notes": "Pricing TBD - will be updated later"
+      "enabled": true
+    },
+    "month_to_month": {
+      "name": "MTMCORE - Month to Month",
+      "description": "Recurring monthly membership (MTMCORE)",
+      "member_type_identifier": "MTMCORE",
+      "pricing": {
+        "bqe": {
+          "monthly_rate": 59.99,
+          "enrollment_fee": 50.00,
+          "annual_fee_min": 24.95,
+          "annual_fee_max": 39.99
+        },
+        "greenpoint": {
+          "monthly_rate": 59.99,
+          "enrollment_fee": 50.00,
+          "annual_fee_min": 24.95,
+          "annual_fee_max": 39.99
+        },
+        "lic": {
+          "monthly_rate": 59.99,
+          "enrollment_fee": 50.00,
+          "annual_fee_min": 24.95,
+          "annual_fee_max": 39.99
+        }
+      },
+      "rules": {
+        "expected_exp_year": 2099,
+        "expected_end_draft_year": 2099,
+        "draft_date_max_months_from_join": 3,
+        "initial_payment_threshold": 150.00,
+        "initial_payment_covers_months": 3,
+        "enrollment_keyword": "ENROLL",
+        "annual_fee_keyword": "ANNUAL FEES",
+        "report_start_date": "2025-01-01",
+        "check_charge_payment_matching": true,
+        "check_monthly_payments": true,
+        "check_enrollment_fee": true,
+        "check_annual_fee": false,
+        "check_cycle": false,
+        "check_balance": false
+      },
+      "enabled": true
     },
     "split_by_type": {
       "name": "Split by Membership Type (Raw Data)",
@@ -118,6 +152,7 @@
   "member_type_mapping": {
     "1MCORE": "1_month_paid_in_full",
     "1YRCORE": "1_year_paid_in_full",
+    "1YRLUX": "1_year_lux_paid_in_full",
     "3MCORE": "3_months_paid_in_full",
     "MTMCORE": "month_to_month"
   },

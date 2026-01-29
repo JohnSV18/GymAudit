@@ -100,6 +100,138 @@ class AuditEngine:
 
         return audit_results
 
+    def audit_pif_grouped(self, data_rows: List[List[str]], expected_price: float = None) -> Dict[str, Any]:
+        """
+        Audit PIF transactions grouped by member.
+
+        For each member_number:
+        1. Collect all transactions
+        2. Verify member names are consistent (flag if mismatch)
+        3. Calculate net balance (sum of all amounts)
+        4. Run standard checks on first row (dates, dues, etc.)
+        5. Flag if net balance != 0
+
+        Args:
+            data_rows: List of transaction rows (new format)
+            expected_price: Expected price for this membership type at this location
+
+        Returns:
+            Dictionary with member_results keyed by member_number
+        """
+        from .red_flags import RedFlag
+
+        cols = self.checker.NEW_FORMAT_COLUMNS
+
+        # Group transactions by member_number
+        member_transactions = defaultdict(list)
+        for row in data_rows:
+            member_number = row[cols['member_number']].strip() if cols['member_number'] < len(row) else ''
+            if member_number:
+                member_transactions[member_number].append(row)
+
+        member_results = {}
+
+        for member_number, transactions in member_transactions.items():
+            first_row = transactions[0]
+
+            # Get member info from first row
+            first_name = first_row[cols['first_name']] if cols['first_name'] < len(first_row) else ''
+            last_name = first_row[cols['last_name']] if cols['last_name'] < len(first_row) else ''
+
+            all_flags = []
+            net_balance = 0.0
+            low_amounts = []
+
+            # Check member name consistency across all transactions
+            name_variants = set()
+            for row in transactions:
+                fn = row[cols['first_name']].strip() if cols['first_name'] < len(row) else ''
+                ln = row[cols['last_name']].strip() if cols['last_name'] < len(row) else ''
+                name_variants.add(f"{fn} {ln}")
+
+            name_mismatch = len(name_variants) > 1
+            if name_mismatch:
+                all_flags.append(RedFlag(
+                    "member_name_mismatch",
+                    f"Different names found for member {member_number}: {', '.join(sorted(name_variants))}",
+                    list(name_variants)
+                ))
+
+            # Calculate thresholds for price checking
+            if expected_price and expected_price > 0:
+                threshold_percent = 90
+                min_expected = expected_price * (threshold_percent / 100)
+            else:
+                threshold_percent = 90
+                min_expected = 0
+
+            # Process each transaction
+            for row in transactions:
+                amount_str = row[cols['amount']] if cols['amount'] < len(row) else ''
+                amount = self._parse_currency(amount_str)
+
+                if amount is not None:
+                    net_balance += amount
+                    abs_amount = abs(amount)
+
+                    # Check if amount is less than 90% of expected price
+                    if expected_price and expected_price > 0 and abs_amount < min_expected:
+                        low_amounts.append(amount)
+
+            # Flag if unpaid balance (charges exceed payments)
+            if net_balance > 0.01:
+                all_flags.append(RedFlag(
+                    "unpaid_balance",
+                    f"Net balance ${net_balance:.2f} - charge without matching payment",
+                    net_balance
+                ))
+
+            # Flag if overpayment (payments exceed charges)
+            if net_balance < -0.01:
+                all_flags.append(RedFlag(
+                    "overpayment",
+                    f"Net balance -${abs(net_balance):.2f} - payment exceeds charges",
+                    net_balance
+                ))
+
+            # Flag low amounts
+            for low_amount in low_amounts:
+                abs_amt = abs(low_amount)
+                txn_type = "Charge" if low_amount > 0 else "Payment"
+                all_flags.append(RedFlag(
+                    "low_amount",
+                    f"{txn_type} ${abs_amt:.2f} is less than {threshold_percent}% of expected ${expected_price:.2f} (min ${min_expected:.2f})",
+                    low_amount
+                ))
+
+            # Run basic date/expiration checks on first row
+            basic_flags = self.checker.check_all(first_row)
+            basic_flags = [f for f in basic_flags if f.flag_type != 'date_invalid' or self._parse_date(first_row[cols['join_date']]) is None]
+            all_flags.extend(basic_flags)
+
+            member_results[member_number] = {
+                'member_number': member_number,
+                'first_name': first_name,
+                'last_name': last_name,
+                'transactions': transactions,
+                'transaction_count': len(transactions),
+                'net_balance': net_balance,
+                'flags': all_flags,
+                'has_flags': len(all_flags) > 0,
+                'flag_count': len(all_flags),
+                'low_amounts': low_amounts,
+                'name_mismatch': name_mismatch,
+                'name_variants': list(name_variants),
+                'first_row': first_row
+            }
+
+        return {
+            'member_results': member_results,
+            'total_members': len(member_results),
+            'flagged_members': sum(1 for r in member_results.values() if r['has_flags']),
+            'total_transactions': sum(len(r['transactions']) for r in member_results.values())
+        }
+
     def audit_file(self, file_path: str, generate_report: bool = True) -> Dict[str, Any]:
         """
         Audit a single file
@@ -127,7 +259,11 @@ class AuditEngine:
             self.checker = create_checker(self.membership_type, self.location, format_type=detected_format)
             self.format_type = detected_format
 
-        # Audit the rows
+        # Use grouped approach for new format, row-by-row for old format
+        if detected_format == 'new':
+            return self._audit_file_grouped(file_data, generate_report)
+
+        # Old format: row-by-row audit
         audit_results = self.audit_rows(file_data['data_rows'])
 
         # Calculate statistics
@@ -178,6 +314,88 @@ class AuditEngine:
             'report_path': report_path
         }
 
+    def _audit_file_grouped(self, file_data: Dict[str, Any], generate_report: bool = True) -> Dict[str, Any]:
+        """
+        Audit a file using grouped member matching (new format only).
+
+        Args:
+            file_data: Validated file data dict from file_reader
+            generate_report: Whether to generate Excel report
+
+        Returns:
+            Dictionary with audit results and statistics
+        """
+        expected_price = self.checker.expected_dues
+        grouped_results = self.audit_pif_grouped(file_data['data_rows'], expected_price)
+
+        # Build flat audit_results list from grouped results (for compatibility)
+        audit_results = []
+        for member_data in grouped_results['member_results'].values():
+            first_row = member_data['first_row']
+            red_flags = member_data['flags']
+
+            result = {
+                'row_data': first_row,
+                'red_flags': red_flags,
+                'has_flags': member_data['has_flags'],
+                'flag_count': member_data['flag_count'],
+                'membership_age': self.checker.calculate_membership_age(first_row),
+                'is_expired': self.checker.is_membership_expired(first_row),
+                'financial_impact': member_data['net_balance'] if member_data['net_balance'] > 0 else 0,
+                'dues_impact': 0,
+                'balance_impact': member_data['net_balance'] if member_data['net_balance'] > 0 else 0,
+                'member_id': member_data['member_number'],
+                'member_name': f"{member_data['first_name']} {member_data['last_name']}"
+            }
+            audit_results.append(result)
+
+        # Calculate statistics
+        total_records = len(file_data['data_rows'])
+        flagged_count = grouped_results['flagged_members']
+        clean_count = grouped_results['total_members'] - flagged_count
+        flagged_percentage = (flagged_count / grouped_results['total_members'] * 100) if grouped_results['total_members'] > 0 else 0
+        total_financial_impact = sum(r['financial_impact'] for r in audit_results)
+        total_dues_impact = sum(r['dues_impact'] for r in audit_results)
+        total_balance_impact = sum(r['balance_impact'] for r in audit_results)
+
+        # Get flagged member IDs
+        flagged_member_ids = [r['member_id'] for r in audit_results if r['has_flags']]
+
+        # Get column mapping for BP detection
+        column_mapping = self.checker.get_bp_detection_columns()
+
+        # Generate report if requested
+        report_path = None
+        if generate_report:
+            original_name = Path(file_data['filename']).stem
+            output_filename = f"{original_name}_Audit_Report.xlsx"
+
+            report_path = self.report_generator.create_grouped_audit_report(
+                header_row=file_data['header'],
+                grouped_results=grouped_results,
+                output_filename=output_filename,
+                column_mapping=column_mapping,
+                bp_config=self.bp_config
+            )
+
+        return {
+            'success': True,
+            'filename': file_data['filename'],
+            'format_type': 'new',
+            'total_records': total_records,
+            'total_members': grouped_results['total_members'],
+            'flagged_count': flagged_count,
+            'clean_count': clean_count,
+            'flagged_percentage': flagged_percentage,
+            'total_financial_impact': total_financial_impact,
+            'total_dues_impact': total_dues_impact,
+            'total_balance_impact': total_balance_impact,
+            'flagged_member_ids': flagged_member_ids,
+            'audit_results': audit_results,
+            'member_results': grouped_results['member_results'],
+            'report_path': report_path
+        }
+
     def audit_uploaded_file(self, uploaded_file, generate_report: bool = True) -> Dict[str, Any]:
         """
         Audit a file from Streamlit upload
@@ -212,7 +430,11 @@ class AuditEngine:
             self.checker = create_checker(self.membership_type, self.location, format_type=detected_format)
             self.format_type = detected_format
 
-        # Audit the rows
+        # Use grouped approach for new format, row-by-row for old format
+        if detected_format == 'new':
+            return self._audit_file_grouped(file_data, generate_report)
+
+        # Old format: row-by-row audit
         audit_results = self.audit_rows(file_data['data_rows'])
 
         # Calculate statistics
@@ -358,13 +580,32 @@ class AuditEngine:
         }
 
     def _parse_date(self, date_str: str) -> Optional[datetime]:
-        """Parse date in M/D/YY format"""
+        """Parse date in multiple formats"""
         if not date_str or not date_str.strip():
             return None
-        try:
-            return datetime.strptime(date_str.strip(), '%m/%d/%y')
-        except:
+
+        date_str = date_str.strip()
+
+        # Skip if it looks like 'nan' or empty
+        if date_str.lower() in ('nan', 'nat', 'none', ''):
             return None
+
+        # Try multiple date formats
+        date_formats = [
+            '%m/%d/%y',            # 1/15/25
+            '%m/%d/%Y',            # 1/15/2025
+            '%Y-%m-%d %H:%M:%S',   # 2025-01-15 00:00:00
+            '%Y-%m-%d',            # 2025-01-15
+            '%m/%d/%Y %H:%M:%S',   # 1/15/2025 00:00:00
+        ]
+
+        for fmt in date_formats:
+            try:
+                return datetime.strptime(date_str, fmt)
+            except ValueError:
+                continue
+
+        return None
 
     def _parse_currency(self, currency_str: str) -> Optional[float]:
         """Parse currency value, handling commas and quotes"""
@@ -397,6 +638,176 @@ class AuditEngine:
             member_type = row[member_type_idx].strip().upper()
             return member_type == 'MTMCORE'
         return False
+
+    def _detect_enrollment_fee(
+        self,
+        transactions: List[List[str]],
+        enrollment_fee: float,
+        enrollment_keyword: str
+    ) -> tuple:
+        """
+        Check if member has enrollment fee transaction.
+        Looks for transaction with amount matching enrollment_fee AND
+        transaction_reference containing enrollment_keyword.
+
+        Returns:
+            Tuple of (found: bool, transaction_date: datetime or None)
+        """
+        cols = self.checker.NEW_FORMAT_COLUMNS
+        ref_col = cols.get('transaction_reference', 19)  # transaction_reference column
+
+        for txn in transactions:
+            amount = self._parse_currency(txn[cols['amount']]) if cols['amount'] < len(txn) else None
+            ref = txn[ref_col].strip().upper() if ref_col < len(txn) else ''
+
+            # Check for enrollment fee: amount matches AND keyword in reference
+            if amount is not None and abs(amount - enrollment_fee) < 0.01:
+                if enrollment_keyword.upper() in ref:
+                    txn_date = self._parse_date(txn[cols['transaction_date']])
+                    return (True, txn_date)
+
+        return (False, None)
+
+    def _detect_initial_payment(
+        self,
+        transactions: List[List[str]],
+        threshold: float
+    ) -> tuple:
+        """
+        Detect large initial payment (prorated + 2 months).
+        Looks for first transaction with amount >= threshold.
+
+        Returns:
+            Tuple of (found: bool, date: datetime or None, amount: float or None)
+        """
+        cols = self.checker.NEW_FORMAT_COLUMNS
+
+        # Sort transactions by date to find the first large payment
+        dated_txns = []
+        for txn in transactions:
+            txn_date = self._parse_date(txn[cols['transaction_date']])
+            amount = self._parse_currency(txn[cols['amount']])
+            if txn_date and amount is not None:
+                dated_txns.append((txn_date, amount, txn))
+
+        dated_txns.sort(key=lambda x: x[0])
+
+        for txn_date, amount, txn in dated_txns:
+            # Initial payment is typically a large negative (payment) or could be charge
+            # We look for absolute amount >= threshold
+            if abs(amount) >= threshold:
+                return (True, txn_date, amount)
+
+        return (False, None, None)
+
+    def _is_annual_fee_transaction(
+        self,
+        row: List[str],
+        keyword: str,
+        min_amount: float,
+        max_amount: float
+    ) -> bool:
+        """
+        Check if transaction is an annual fee.
+        Based on transaction_reference containing keyword AND amount in range.
+        """
+        cols = self.checker.NEW_FORMAT_COLUMNS
+        ref_col = cols.get('transaction_reference', 19)
+
+        amount = self._parse_currency(row[cols['amount']]) if cols['amount'] < len(row) else None
+        ref = row[ref_col].strip().upper() if ref_col < len(row) else ''
+
+        if amount is None:
+            return False
+
+        abs_amount = abs(amount)
+        return keyword.upper() in ref and min_amount <= abs_amount <= max_amount
+
+    def _check_mtm_charge_payment_pairs(
+        self,
+        transactions: List[List[str]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Verify each charge has matching payment from same member.
+        Returns list of unmatched transactions needing verification.
+
+        Charges (positive amounts) should have adjacent payment (negative amount)
+        from the same member within reasonable time window.
+        """
+        cols = self.checker.NEW_FORMAT_COLUMNS
+        unmatched = []
+
+        # Group by member key and sort by date
+        txn_data = []
+        for i, txn in enumerate(transactions):
+            txn_date = self._parse_date(txn[cols['transaction_date']])
+            amount = self._parse_currency(txn[cols['amount']])
+            if txn_date and amount is not None:
+                txn_data.append({
+                    'index': i,
+                    'date': txn_date,
+                    'amount': amount,
+                    'txn': txn,
+                    'matched': False
+                })
+
+        txn_data.sort(key=lambda x: x['date'])
+
+        # Find charges without matching payments
+        for i, txn in enumerate(txn_data):
+            if txn['amount'] > 0:  # This is a charge
+                charge_amount = txn['amount']
+                charge_date = txn['date']
+
+                # Look for matching payment (within 7 days)
+                matched = False
+                for j, other in enumerate(txn_data):
+                    if i == j or other['matched']:
+                        continue
+                    if other['amount'] < 0:  # This is a payment
+                        payment_amount = abs(other['amount'])
+                        days_diff = abs((other['date'] - charge_date).days)
+
+                        # Match if amounts are close and within 7 days
+                        if abs(charge_amount - payment_amount) < 0.01 and days_diff <= 7:
+                            txn['matched'] = True
+                            other['matched'] = True
+                            matched = True
+                            break
+
+                if not matched:
+                    unmatched.append({
+                        'transaction': txn['txn'],
+                        'date': txn['date'],
+                        'amount': txn['amount'],
+                        'type': 'charge_without_payment'
+                    })
+
+        return unmatched
+
+    def _calculate_monthly_coverage_start(
+        self,
+        join_date: datetime,
+        has_initial_payment: bool,
+        initial_payment_date: datetime,
+        report_start: datetime,
+        covers_months: int
+    ) -> datetime:
+        """
+        Determine when monthly payment checks should begin.
+
+        Logic:
+        - If initial payment found: coverage starts after initial_payment_covers_months
+        - If no initial payment: coverage starts at report_start_date or join_date, whichever is later
+        """
+        if has_initial_payment and initial_payment_date:
+            # Coverage starts after the initial payment covers its months
+            coverage_start = initial_payment_date + relativedelta(months=covers_months)
+        else:
+            # No initial payment detected, use join_date or report_start
+            coverage_start = max(join_date, report_start) if join_date else report_start
+
+        return coverage_start
 
     def audit_1mcore_transactions(
         self,
@@ -483,19 +894,26 @@ class AuditEngine:
                     low_amount
                 ))
 
-            # Flag price mismatches
-            for mismatch_amount in price_mismatches:
-                all_flags.append(RedFlag(
-                    "price_mismatch",
-                    f"Charge ${mismatch_amount:.2f} doesn't match expected ${expected_price:.2f} - possible wrong membership type",
-                    mismatch_amount
-                ))
-
             # Run basic date/expiration checks on first row
             basic_flags = self.checker.check_all(first_row)
             # Filter out any existing date_invalid flags since we're handling dates better now
             basic_flags = [f for f in basic_flags if f.flag_type != 'date_invalid' or self._parse_date(first_row[cols['join_date']]) is None]
             all_flags.extend(basic_flags)
+
+            # Check member name consistency
+            name_variants = set()
+            for row in transactions:
+                fn = row[cols['first_name']].strip() if cols['first_name'] < len(row) else ''
+                ln = row[cols['last_name']].strip() if cols['last_name'] < len(row) else ''
+                name_variants.add(f"{fn} {ln}")
+
+            name_mismatch = len(name_variants) > 1
+            if name_mismatch:
+                all_flags.append(RedFlag(
+                    "member_name_mismatch",
+                    f"Different names found for member {member_number}: {', '.join(sorted(name_variants))}",
+                    list(name_variants)
+                ))
 
             member_results[member_number] = {
                 'member_number': member_number,
@@ -504,11 +922,14 @@ class AuditEngine:
                 'transactions': transactions,
                 'transaction_count': len(transactions),
                 'total_amount': total_amount,
+                'net_balance': total_amount,
                 'flags': all_flags,
                 'has_flags': len(all_flags) > 0,
                 'flag_count': len(all_flags),
                 'price_mismatches': price_mismatches,
                 'low_amounts': low_amounts,
+                'name_mismatch': name_mismatch,
+                'name_variants': list(name_variants),
                 'first_row': first_row  # Keep for report generation
             }
 
@@ -585,9 +1006,12 @@ class AuditEngine:
         Audit Month-to-Month membership transactions.
 
         Groups transactions by member and checks:
-        1. Basic validation rules (exp year, cycle, draft dates)
-        2. Monthly payment verification (after 3-month grace period)
-        3. Duplicate payment detection
+        1. Charge/payment pair matching - verifies each charge has matching payment
+        2. Member type detection - New (has enrollment fee) vs Existing
+        3. Missing enrollment fee - flags new members (join >= report_start) without enrollment
+        4. Initial payment detection - looks for larger payment (~$180+)
+        5. Monthly payment verification - from coverage start to current date
+        6. Annual fee tracking - informational only
 
         Args:
             data_rows: List of transaction rows (new format)
@@ -602,8 +1026,44 @@ class AuditEngine:
             system_date = datetime.now()
 
         cols = self.checker.NEW_FORMAT_COLUMNS
-        min_monthly_fee = self.checker.get_min_monthly_fee()
-        grace_months = self.checker.get_grace_period_months()
+        rules = self.checker.rules
+
+        # Get pricing configuration for the location
+        config = load_config()
+        mtm_config = config.get('membership_types', {}).get('month_to_month', {})
+        pricing = mtm_config.get('pricing', {}).get(self.location, {})
+
+        # Extract pricing values (handle both old dict format and new nested format)
+        if isinstance(pricing, dict):
+            monthly_rate = pricing.get('monthly_rate', 59.99)
+            enrollment_fee = pricing.get('enrollment_fee', 50.00)
+            annual_fee_min = pricing.get('annual_fee_min', 24.95)
+            annual_fee_max = pricing.get('annual_fee_max', 39.99)
+        else:
+            # Fallback to old format
+            monthly_rate = 59.99
+            enrollment_fee = 50.00
+            annual_fee_min = 24.95
+            annual_fee_max = 39.99
+
+        # Get rule parameters
+        initial_payment_threshold = rules.get('initial_payment_threshold', 150.00)
+        initial_payment_covers_months = rules.get('initial_payment_covers_months', 3)
+        enrollment_keyword = rules.get('enrollment_keyword', 'ENROLL')
+        annual_fee_keyword = rules.get('annual_fee_keyword', 'ANNUAL FEES')
+        report_start_str = rules.get('report_start_date', '2025-01-01')
+
+        # Parse report start date
+        try:
+            report_start = datetime.strptime(report_start_str, '%Y-%m-%d')
+        except:
+            report_start = datetime(2025, 1, 1)
+
+        # Check flags
+        check_charge_payment = rules.get('check_charge_payment_matching', True)
+        check_monthly = rules.get('check_monthly_payments', True)
+        check_enrollment = rules.get('check_enrollment_fee', True)
+        check_annual = rules.get('check_annual_fee', False)
 
         # Group transactions by member
         member_transactions = defaultdict(list)
@@ -635,84 +1095,189 @@ class AuditEngine:
                     'last_name': last_name,
                     'member_number': member_number,
                     'transactions': transactions,
+                    'transaction_count': len(transactions),
                     'flags': [RedFlag("join_date_invalid", "Invalid join date")],
                     'missing_months': [],
-                    'duplicate_months': [],
-                    'has_flags': True
+                    'has_flags': True,
+                    'flag_count': 1,
+                    'member_type': 'Unknown',
+                    'has_enrollment_fee': False,
+                    'has_initial_payment': False,
+                    'has_annual_fee': False,
+                    'coverage_start': None,
+                    'months_paid_count': 0
                 }
                 continue
 
-            # Calculate grace period end
-            grace_end = join_date + relativedelta(months=grace_months)
+            all_flags = []
 
-            # Get all required months from grace_end to system_date
-            required_months = []
-            current_month = datetime(grace_end.year, grace_end.month, 1)
-            system_month = datetime(system_date.year, system_date.month, 1)
+            # --- Step 1: Check charge/payment pairs ---
+            unmatched_charges = []
+            if check_charge_payment:
+                unmatched_charges = self._check_mtm_charge_payment_pairs(transactions)
+                for unmatched in unmatched_charges:
+                    all_flags.append(RedFlag(
+                        "needs_verification",
+                        f"Charge ${unmatched['amount']:.2f} on {unmatched['date'].strftime('%m/%d/%y')} without matching payment",
+                        unmatched['amount']
+                    ))
 
-            while current_month <= system_month:
-                required_months.append(self._get_month_key(current_month))
-                current_month += relativedelta(months=1)
+            # --- Step 2: Detect enrollment fee (determines member type) ---
+            has_enrollment, enrollment_date = self._detect_enrollment_fee(
+                transactions, enrollment_fee, enrollment_keyword
+            )
 
-            # Get payment months from transactions (where amount >= min_monthly_fee)
-            payment_months = defaultdict(list)  # month -> list of transaction indices
-            for idx, txn in enumerate(transactions):
-                txn_date_str = txn[cols['transaction_date']]
-                txn_date = self._parse_date(txn_date_str)
-                amount = self._parse_currency(txn[cols['amount']])
+            # Determine member type
+            is_new_member = has_enrollment
+            member_type = 'New' if is_new_member else 'Existing'
 
-                if txn_date and amount is not None and amount >= min_monthly_fee:
-                    month_key = self._get_month_key(txn_date)
-                    payment_months[month_key].append(idx)
+            # --- Step 3: Flag missing enrollment for new members ---
+            if check_enrollment:
+                # Only flag if join_date is on or after report_start AND no enrollment fee
+                if join_date >= report_start and not has_enrollment:
+                    all_flags.append(RedFlag(
+                        "missing_enrollment_fee",
+                        f"New member (joined {join_date.strftime('%m/%d/%y')}) without ${enrollment_fee:.2f} enrollment fee",
+                        enrollment_fee
+                    ))
 
-            # Check for missing payments
+            # --- Step 4: Detect initial payment ---
+            has_initial, initial_date, initial_amount = self._detect_initial_payment(
+                transactions, initial_payment_threshold
+            )
+
+            # --- Step 5: Calculate coverage start for monthly payment checks ---
+            coverage_start = self._calculate_monthly_coverage_start(
+                join_date=join_date,
+                has_initial_payment=has_initial,
+                initial_payment_date=initial_date,
+                report_start=report_start,
+                covers_months=initial_payment_covers_months
+            )
+
+            # --- Step 6: Check monthly payments from coverage_start to today ---
             missing_months = []
-            for required_month in required_months:
-                if required_month not in payment_months:
-                    missing_months.append(required_month)
+            months_paid = []
 
-            # Check for duplicate payments
-            duplicate_months = []
-            for month_key, txn_indices in payment_months.items():
-                if len(txn_indices) > 1:
-                    duplicate_months.append(month_key)
+            if check_monthly:
+                # Get payment months from transactions (where absolute amount >= monthly_rate)
+                payment_months = defaultdict(list)
+                for idx, txn in enumerate(transactions):
+                    txn_date_str = txn[cols['transaction_date']]
+                    txn_date = self._parse_date(txn_date_str)
+                    amount = self._parse_currency(txn[cols['amount']])
 
-            # Run basic validation rules on first transaction
+                    if txn_date and amount is not None:
+                        # Consider both charges and payments that could qualify as monthly payment
+                        # Usually payments are negative, charges are positive
+                        if abs(amount) >= monthly_rate * 0.9:  # 90% tolerance
+                            month_key = self._get_month_key(txn_date)
+                            payment_months[month_key].append(idx)
+
+                months_paid = list(payment_months.keys())
+
+                # Build required months from coverage_start to system_date
+                required_months = []
+                if coverage_start:
+                    current_month = datetime(coverage_start.year, coverage_start.month, 1)
+                    system_month = datetime(system_date.year, system_date.month, 1)
+
+                    while current_month <= system_month:
+                        required_months.append(self._get_month_key(current_month))
+                        current_month += relativedelta(months=1)
+
+                # Check for missing payments
+                for required_month in required_months:
+                    if required_month not in payment_months:
+                        missing_months.append(required_month)
+                        all_flags.append(RedFlag(
+                            "missing_monthly_payment",
+                            f"No qualifying payment (>= ${monthly_rate:.2f}) for {required_month}",
+                            required_month
+                        ))
+
+            # --- Step 7: Track annual fee (informational) ---
+            has_annual_fee = False
+            if check_annual:
+                for txn in transactions:
+                    if self._is_annual_fee_transaction(txn, annual_fee_keyword, annual_fee_min, annual_fee_max):
+                        has_annual_fee = True
+                        break
+
+                if not has_annual_fee:
+                    all_flags.append(RedFlag(
+                        "missing_annual_fee",
+                        f"No annual fee transaction ({annual_fee_keyword}) found",
+                        0
+                    ))
+
+            # --- Check member name consistency ---
+            name_variants = set()
+            for txn in transactions:
+                fn = txn[cols['first_name']].strip() if cols['first_name'] < len(txn) else ''
+                ln = txn[cols['last_name']].strip() if cols['last_name'] < len(txn) else ''
+                name_variants.add(f"{fn} {ln}")
+
+            name_mismatch = len(name_variants) > 1
+            if name_mismatch:
+                all_flags.append(RedFlag(
+                    "member_name_mismatch",
+                    f"Different names found for member {member_number}: {', '.join(sorted(name_variants))}",
+                    list(name_variants)
+                ))
+
+            # --- Calculate net balance ---
+            net_balance = 0.0
+            for txn in transactions:
+                amount = self._parse_currency(txn[cols['amount']]) if cols['amount'] < len(txn) else None
+                if amount is not None:
+                    net_balance += amount
+
+            if net_balance > 0.01:
+                all_flags.append(RedFlag(
+                    "unpaid_balance",
+                    f"Net balance ${net_balance:.2f} - charge without matching payment",
+                    net_balance
+                ))
+            elif net_balance < -0.01:
+                all_flags.append(RedFlag(
+                    "overpayment",
+                    f"Net balance -${abs(net_balance):.2f} - payment exceeds charges",
+                    net_balance
+                ))
+
+            # --- Run basic validation rules (exp year, draft dates) ---
             basic_flags = self._check_basic_mtm_rules(first_row)
+            all_flags.extend(basic_flags)
 
-            # Create flags for missing/duplicate payments
-            all_flags = basic_flags.copy()
-
-            for missing_month in missing_months:
-                all_flags.append(RedFlag(
-                    "missing_payment",
-                    f"No qualifying payment (>= ${min_monthly_fee:.2f}) for {missing_month}",
-                    missing_month
-                ))
-
-            for dup_month in duplicate_months:
-                all_flags.append(RedFlag(
-                    "duplicate_payment",
-                    f"Multiple transactions in {dup_month}",
-                    dup_month
-                ))
-
+            # Build result
             member_results[member_key] = {
                 'member_key': member_key,
                 'first_name': first_name,
                 'last_name': last_name,
                 'member_number': member_number,
                 'join_date': join_date,
-                'grace_end': grace_end,
                 'transactions': transactions,
                 'transaction_count': len(transactions),
+                'net_balance': net_balance,
                 'flags': all_flags,
-                'missing_months': missing_months,
-                'duplicate_months': duplicate_months,
-                'required_months': required_months,
-                'payment_months': list(payment_months.keys()),
                 'has_flags': len(all_flags) > 0,
-                'flag_count': len(all_flags)
+                'flag_count': len(all_flags),
+                'name_mismatch': name_mismatch,
+                'name_variants': list(name_variants),
+                # New fields
+                'member_type': member_type,
+                'has_enrollment_fee': has_enrollment,
+                'enrollment_date': enrollment_date,
+                'has_initial_payment': has_initial,
+                'initial_payment_date': initial_date,
+                'initial_payment_amount': initial_amount,
+                'coverage_start': coverage_start,
+                'missing_months': missing_months,
+                'months_paid': months_paid,
+                'months_paid_count': len(months_paid),
+                'has_annual_fee': has_annual_fee,
+                'unmatched_charges': len(unmatched_charges)
             }
 
         return {
@@ -964,6 +1529,7 @@ class AuditEngine:
                     'is_known_type': True,
                     'has_rules': True,
                     'is_1mcore': True,
+                    'is_grouped': True,
                     'total_records': len(rows),
                     'total_members': onemcore_results['total_members'],
                     'flagged_count': flagged_count,
@@ -979,44 +1545,49 @@ class AuditEngine:
                 total_financial_impact += type_financial_impact
 
             elif config_key and config_key != 'month_to_month':
-                # Known non-MTM type (not 1MCORE) - apply standard audit rules
+                # Known non-MTM type (not 1MCORE) - use grouped member matching
                 type_checker = create_checker(config_key, self.location, format_type='new')
-                audit_results = []
+                self.checker = type_checker
+                expected_price = type_checker.expected_dues
 
-                for row in rows:
-                    red_flags = type_checker.check_all(row)
-                    membership_age = type_checker.calculate_membership_age(row)
-                    is_expired = type_checker.is_membership_expired(row)
-                    financial_impact = type_checker.get_financial_impact(row, red_flags)
-                    impact_breakdown = type_checker.get_financial_impact_breakdown(row, red_flags)
+                grouped_results = self.audit_pif_grouped(rows, expected_price)
+
+                # Build audit_results from member_results for consistent reporting
+                audit_results = []
+                for member_data in grouped_results['member_results'].values():
+                    first_row = member_data['first_row']
+                    red_flags = member_data['flags']
 
                     result = {
-                        'row_data': row,
+                        'row_data': first_row,
                         'red_flags': red_flags,
-                        'has_flags': len(red_flags) > 0,
-                        'flag_count': len(red_flags),
-                        'membership_age': membership_age,
-                        'is_expired': is_expired,
-                        'financial_impact': financial_impact,
-                        'dues_impact': impact_breakdown['dues_impact'],
-                        'balance_impact': impact_breakdown['balance_impact'],
-                        'member_id': row[type_checker.COL_MEMBER] if len(row) > type_checker.COL_MEMBER else '',
-                        'member_name': f"{row[type_checker.COL_FIRST_NAME]} {row[type_checker.COL_LAST_NAME]}" if len(row) > type_checker.COL_FIRST_NAME else ''
+                        'has_flags': member_data['has_flags'],
+                        'flag_count': member_data['flag_count'],
+                        'membership_age': type_checker.calculate_membership_age(first_row),
+                        'is_expired': type_checker.is_membership_expired(first_row),
+                        'financial_impact': member_data['net_balance'] if member_data['net_balance'] > 0 else 0,
+                        'dues_impact': 0,
+                        'balance_impact': member_data['net_balance'] if member_data['net_balance'] > 0 else 0,
+                        'member_id': member_data['member_number'],
+                        'member_name': f"{member_data['first_name']} {member_data['last_name']}"
                     }
                     audit_results.append(result)
 
-                flagged_count = sum(1 for r in audit_results if r['has_flags'])
+                flagged_count = grouped_results['flagged_members']
                 type_financial_impact = sum(r['financial_impact'] for r in audit_results)
 
                 type_results[member_type] = {
                     'config_key': config_key,
                     'is_known_type': True,
                     'has_rules': True,
+                    'is_grouped': True,
                     'total_records': len(rows),
+                    'total_members': grouped_results['total_members'],
                     'flagged_count': flagged_count,
-                    'flagged_percentage': (flagged_count / len(rows) * 100) if rows else 0,
+                    'flagged_percentage': (flagged_count / grouped_results['total_members'] * 100) if grouped_results['total_members'] > 0 else 0,
                     'financial_impact': type_financial_impact,
                     'audit_results': audit_results,
+                    'member_results': grouped_results['member_results'],
                     'rows': rows
                 }
 
