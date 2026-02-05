@@ -34,6 +34,42 @@ class AuditReportGenerator:
                 bottom=Side(style='thick')
             )
 
+    def _distribute_flags_to_rows(self, flags: List, num_rows: int) -> List[str]:
+        """
+        Distribute flags across transaction rows, one flag per row.
+        If more flags than rows, overflow goes on the last row.
+
+        Args:
+            flags: List of flag objects or strings
+            num_rows: Number of transaction rows for this member
+
+        Returns:
+            List of note strings, one per row
+        """
+        if not flags:
+            return [""] * num_rows
+
+        # Convert flags to bullet-point strings
+        flag_strings = [f"• {str(flag)}" for flag in flags]
+
+        # Create notes for each row
+        notes = []
+        for i in range(num_rows):
+            if i < len(flag_strings) - 1:
+                # One flag per row until second-to-last position
+                notes.append(flag_strings[i])
+            elif i == num_rows - 1:
+                # Last row: add all remaining flags
+                remaining = flag_strings[i:]
+                if remaining:
+                    notes.append("\n".join(remaining))
+                else:
+                    notes.append("")
+            else:
+                notes.append("")
+
+        return notes
+
     def __init__(self, output_folder: str = 'outputs'):
         """
         Initialize report generator
@@ -140,7 +176,7 @@ class AuditReportGenerator:
                 bp.append(result)
             elif is_xx:
                 xx.append(result)
-            elif result.get('has_flags', False):
+            elif result.get('has_flags', False) and result.get('flags'):
                 flagged.append(result)
             else:
                 valid.append(result)
@@ -451,11 +487,12 @@ class AuditReportGenerator:
 
             for member_result in flagged_members:
                 flags = member_result.get('flags', [])
-                notes = " | ".join([str(flag) for flag in flags]) if flags else ""
+                transactions = member_result['transactions']
+                distributed_notes = self._distribute_flags_to_rows(flags, len(transactions))
                 net_balance = member_result.get('net_balance', 0.0)
 
-                for txn in member_result['transactions']:
-                    enhanced_row = list(txn) + [f"${net_balance:.2f}", notes]
+                for i, txn in enumerate(transactions):
+                    enhanced_row = list(txn) + [f"${net_balance:.2f}", distributed_notes[i]]
                     for col_idx, value in enumerate(enhanced_row, start=1):
                         cell = audit_sheet.cell(row=excel_row, column=col_idx, value=value)
                         cell.fill = self.HIGHLIGHT_FILL
@@ -477,11 +514,12 @@ class AuditReportGenerator:
 
             for member_result in xx_members:
                 flags = member_result.get('flags', [])
-                notes = " | ".join([str(flag) for flag in flags]) if flags else ""
+                transactions = member_result['transactions']
+                distributed_notes = self._distribute_flags_to_rows(flags, len(transactions))
                 net_balance = member_result.get('net_balance', 0.0)
 
-                for txn in member_result['transactions']:
-                    enhanced_row = list(txn) + [f"${net_balance:.2f}", notes]
+                for i, txn in enumerate(transactions):
+                    enhanced_row = list(txn) + [f"${net_balance:.2f}", distributed_notes[i]]
                     for col_idx, value in enumerate(enhanced_row, start=1):
                         cell = audit_sheet.cell(row=excel_row, column=col_idx, value=value)
                         cell.fill = self.XX_FILL
@@ -503,11 +541,12 @@ class AuditReportGenerator:
 
             for member_result in bp_members:
                 flags = member_result.get('flags', [])
-                notes = " | ".join([str(flag) for flag in flags]) if flags else ""
+                transactions = member_result['transactions']
+                distributed_notes = self._distribute_flags_to_rows(flags, len(transactions))
                 net_balance = member_result.get('net_balance', 0.0)
 
-                for txn in member_result['transactions']:
-                    enhanced_row = list(txn) + [f"${net_balance:.2f}", notes]
+                for i, txn in enumerate(transactions):
+                    enhanced_row = list(txn) + [f"${net_balance:.2f}", distributed_notes[i]]
                     for col_idx, value in enumerate(enhanced_row, start=1):
                         cell = audit_sheet.cell(row=excel_row, column=col_idx, value=value)
                         cell.fill = self.BP_FILL
@@ -528,9 +567,10 @@ class AuditReportGenerator:
             )
 
             for member_result in valid_members:
+                transactions = member_result['transactions']
                 net_balance = member_result.get('net_balance', 0.0)
 
-                for txn in member_result['transactions']:
+                for txn in transactions:
                     enhanced_row = list(txn) + [f"${net_balance:.2f}", ""]
                     for col_idx, value in enumerate(enhanced_row, start=1):
                         audit_sheet.cell(row=excel_row, column=col_idx, value=value)
@@ -1150,559 +1190,6 @@ class AuditReportGenerator:
         # Auto-adjust widths
         self._auto_adjust_column_widths(txn_sheet)
 
-    def create_all_types_report(
-        self,
-        header_row: List[str],
-        type_results: Dict[str, Any],
-        output_filename: str,
-        column_mapping: Dict[str, int] = None,
-        bp_config: Dict[str, Any] = None,
-        member_type_mapping: Dict[str, str] = None
-    ) -> str:
-        """
-        Create Excel report with tabs for each member_type plus a summary tab.
-
-        Args:
-            header_row: Column headers from original file
-            type_results: Dictionary with results per member_type
-            output_filename: Name for output file
-            column_mapping: Dictionary with column name to index mappings
-            bp_config: BP detection configuration
-            member_type_mapping: Mapping of member_type codes to config keys
-
-        Returns:
-            Full path to generated report file
-        """
-        wb = Workbook()
-
-        # Remove default sheet, we'll add our own
-        wb.remove(wb.active)
-
-        # Create Summary sheet first
-        summary_sheet = wb.create_sheet("Summary", 0)
-        self._add_all_types_summary_sheet(summary_sheet, type_results, member_type_mapping)
-
-        # Get column indices for BP detection
-        column_indices = []
-        if column_mapping:
-            bp_columns = bp_config.get('columns', ['code', 'member_type', 'member_group']) if bp_config else ['code', 'member_type', 'member_group']
-            for col_name in bp_columns:
-                idx = column_mapping.get(col_name)
-                if idx is not None and idx >= 0:
-                    column_indices.append(idx)
-        if not column_indices:
-            column_indices = [11, 9, 10]  # code, member_type, member_group in new format
-
-        # Create a tab for each member_type
-        for member_type, results in type_results.items():
-            # Sanitize sheet name (max 31 chars, no special chars)
-            sheet_name = member_type[:31].replace('/', '-').replace('\\', '-').replace('*', '').replace('?', '').replace('[', '').replace(']', '')
-            if not sheet_name:
-                sheet_name = "Unknown"
-
-            type_sheet = wb.create_sheet(sheet_name)
-
-            if results.get('is_mtm'):
-                # MTM type - use member-based format
-                self._write_mtm_type_sheet(type_sheet, header_row, results, column_indices, bp_config)
-            else:
-                # Standard type or unknown - use row-based format
-                self._write_standard_type_sheet(type_sheet, header_row, results, column_indices, bp_config)
-
-        # Save workbook
-        output_path = self.output_folder / output_filename
-        wb.save(output_path)
-
-        return str(output_path)
-
-    def _add_all_types_summary_sheet(
-        self,
-        sheet,
-        type_results: Dict[str, Any],
-        member_type_mapping: Dict[str, str] = None
-    ):
-        """Add summary sheet for all types report"""
-
-        # Title
-        sheet['A1'] = "ALL MEMBERSHIP TYPES AUDIT SUMMARY"
-        sheet['A1'].font = Font(bold=True, size=16)
-
-        # Overall totals
-        row = 3
-        total_records = sum(r.get('total_records', 0) for r in type_results.values())
-        total_flagged = 0
-        total_financial_impact = 0
-
-        for results in type_results.values():
-            if results.get('is_mtm'):
-                total_flagged += results.get('flagged_members', 0)
-            else:
-                total_flagged += results.get('flagged_count', 0)
-            total_financial_impact += results.get('financial_impact', 0)
-
-        sheet[f'A{row}'] = "Total Records:"
-        sheet[f'B{row}'] = total_records
-        sheet[f'A{row}'].font = self.BOLD_FONT
-
-        row += 1
-        sheet[f'A{row}'] = "Total Flagged:"
-        sheet[f'B{row}'] = total_flagged
-        sheet[f'A{row}'].font = self.BOLD_FONT
-        sheet[f'B{row}'].fill = self.HIGHLIGHT_FILL
-
-        row += 1
-        flagged_pct = (total_flagged / total_records * 100) if total_records > 0 else 0
-        sheet[f'A{row}'] = "Flagged Percentage:"
-        sheet[f'B{row}'] = f"{flagged_pct:.1f}%"
-        sheet[f'A{row}'].font = self.BOLD_FONT
-
-        row += 1
-        sheet[f'A{row}'] = "Total Financial Impact:"
-        sheet[f'B{row}'] = f"${total_financial_impact:,.2f}"
-        sheet[f'A{row}'].font = self.BOLD_FONT
-        sheet[f'B{row}'].font = Font(bold=True, color="FF0000")
-
-        # Breakdown by member type
-        row += 3
-        sheet[f'A{row}'] = "BREAKDOWN BY MEMBER TYPE"
-        sheet[f'A{row}'].font = Font(bold=True, size=14)
-
-        row += 2
-        # Header row for breakdown table
-        headers = ["Member Type", "Config", "Records", "Flagged", "Flag %", "Financial Impact", "Rules Applied"]
-        for col_idx, header_text in enumerate(headers, start=1):
-            cell = sheet.cell(row=row, column=col_idx, value=header_text)
-            cell.font = self.BOLD_FONT
-            cell.fill = self.HEADER_FILL
-
-        row += 1
-
-        # Sort by record count descending
-        sorted_types = sorted(type_results.items(), key=lambda x: x[1].get('total_records', 0), reverse=True)
-
-        for member_type, results in sorted_types:
-            config_key = results.get('config_key', 'N/A')
-            config_name = config_key if config_key else 'Unknown'
-
-            records = results.get('total_records', 0)
-
-            if results.get('is_mtm'):
-                flagged = results.get('flagged_members', 0)
-            else:
-                flagged = results.get('flagged_count', 0)
-
-            flag_pct = (flagged / records * 100) if records > 0 else 0
-            financial_impact = results.get('financial_impact', 0)
-            has_rules = "Yes" if results.get('has_rules') else "No (raw data)"
-
-            sheet.cell(row=row, column=1, value=member_type)
-            sheet.cell(row=row, column=2, value=config_name)
-            sheet.cell(row=row, column=3, value=records)
-
-            flagged_cell = sheet.cell(row=row, column=4, value=flagged)
-            if flagged > 0:
-                flagged_cell.fill = self.HIGHLIGHT_FILL
-
-            sheet.cell(row=row, column=5, value=f"{flag_pct:.1f}%")
-            sheet.cell(row=row, column=6, value=f"${financial_impact:,.2f}")
-            sheet.cell(row=row, column=7, value=has_rules)
-
-            row += 1
-
-        # Legend
-        row += 2
-        sheet[f'A{row}'] = "LEGEND"
-        sheet[f'A{row}'].font = Font(bold=True, size=12)
-
-        row += 1
-        sheet[f'A{row}'] = "Known Types:"
-        sheet[f'B{row}'] = "1MCORE (1 Month PIF), 1YRCORE (1 Year PIF), 3MCORE (3 Month PIF), MTMCORE (Month to Month)"
-
-        row += 1
-        sheet[f'A{row}'] = "Unknown Types:"
-        sheet[f'B{row}'] = "Raw data only - no red flag rules applied. Review data to define rules."
-
-        row += 2
-        yellow_cell = sheet.cell(row=row, column=1, value="Yellow")
-        yellow_cell.fill = self.HIGHLIGHT_FILL
-        sheet[f'B{row}'] = "= Flagged accounts (red flags detected)"
-
-        row += 1
-        blue_cell = sheet.cell(row=row, column=1, value="Light Blue")
-        blue_cell.fill = self.XX_FILL
-        sheet[f'B{row}'] = "= XX code accounts (code column = 'xx')"
-
-        row += 1
-        orange_cell = sheet.cell(row=row, column=1, value="Orange")
-        orange_cell.fill = self.BP_FILL
-        sheet[f'B{row}'] = "= Billing Problem accounts (BP indicator in code/member_type)"
-
-        # Auto-adjust widths
-        sheet.column_dimensions['A'].width = 20
-        sheet.column_dimensions['B'].width = 25
-        sheet.column_dimensions['C'].width = 12
-        sheet.column_dimensions['D'].width = 12
-        sheet.column_dimensions['E'].width = 12
-        sheet.column_dimensions['F'].width = 18
-        sheet.column_dimensions['G'].width = 18
-
-    def _write_standard_type_sheet(
-        self,
-        sheet,
-        header_row: List[str],
-        results: Dict[str, Any],
-        column_indices: List[int],
-        bp_config: Dict[str, Any]
-    ):
-        """Write a sheet for a standard (non-MTM) member type"""
-
-        # Check if this is a grouped result
-        if results.get('is_grouped') and results.get('member_results'):
-            self._write_grouped_type_sheet(sheet, header_row, results, column_indices, bp_config)
-            return
-
-        # Add Notes column to header
-        enhanced_header = header_row + ["Notes"]
-        col_count = len(enhanced_header)
-
-        # Write header row
-        for col_idx, header_text in enumerate(enhanced_header, start=1):
-            cell = sheet.cell(row=1, column=col_idx, value=header_text)
-            cell.font = self.BOLD_FONT
-            cell.fill = self.HEADER_FILL
-            cell.alignment = self.CENTER_ALIGN
-
-        audit_results = results.get('audit_results', [])
-        rows = results.get('rows', [])
-
-        # If we have audit_results with row_data, use those
-        if audit_results and 'row_data' in audit_results[0]:
-            data_pairs = [(r.get('row_data', []), r) for r in audit_results]
-        else:
-            # Pair rows with empty results
-            data_pairs = [(row, {'red_flags': [], 'has_flags': False}) for row in rows]
-
-        # Get code column index for XX detection
-        code_col_idx = column_indices[0] if column_indices else 11  # code column is first in the list
-
-        # Categorize rows
-        flagged_rows, xx_rows, bp_rows, valid_rows = self._categorize_rows(
-            [pair[0] for pair in data_pairs],
-            [pair[1] for pair in data_pairs],
-            column_indices,
-            bp_config,
-            code_col_idx
-        )
-
-        excel_row = 2
-
-        # Section 1: FLAGGED ACCOUNTS
-        if flagged_rows:
-            excel_row = self._write_section_header(
-                sheet, excel_row,
-                f"FLAGGED ACCOUNTS ({len(flagged_rows)} records)",
-                col_count
-            )
-
-            for data_row, audit_result in flagged_rows:
-                red_flags = audit_result.get('red_flags', [])
-                notes = " | ".join([str(flag) for flag in red_flags]) if red_flags else ""
-                enhanced_row = list(data_row) + [notes]
-
-                for col_idx, value in enumerate(enhanced_row, start=1):
-                    cell = sheet.cell(row=excel_row, column=col_idx, value=value)
-                    cell.fill = self.HIGHLIGHT_FILL
-
-                excel_row += 1
-
-            excel_row += 1
-
-        # Section 2: XX CODE ACCOUNTS
-        if xx_rows:
-            excel_row = self._write_section_header(
-                sheet, excel_row,
-                f"XX CODE ACCOUNTS ({len(xx_rows)} records)",
-                col_count
-            )
-
-            for data_row, audit_result in xx_rows:
-                red_flags = audit_result.get('red_flags', [])
-                notes = " | ".join([str(flag) for flag in red_flags]) if red_flags else ""
-                enhanced_row = list(data_row) + [notes]
-
-                for col_idx, value in enumerate(enhanced_row, start=1):
-                    cell = sheet.cell(row=excel_row, column=col_idx, value=value)
-                    cell.fill = self.XX_FILL
-
-                excel_row += 1
-
-            excel_row += 1
-
-        # Section 3: BILLING PROBLEM ACCOUNTS
-        if bp_rows:
-            excel_row = self._write_section_header(
-                sheet, excel_row,
-                f"BILLING PROBLEM ACCOUNTS ({len(bp_rows)} records)",
-                col_count
-            )
-
-            for data_row, audit_result in bp_rows:
-                red_flags = audit_result.get('red_flags', [])
-                notes = " | ".join([str(flag) for flag in red_flags]) if red_flags else ""
-                enhanced_row = list(data_row) + [notes]
-
-                for col_idx, value in enumerate(enhanced_row, start=1):
-                    cell = sheet.cell(row=excel_row, column=col_idx, value=value)
-                    cell.fill = self.BP_FILL
-
-                excel_row += 1
-
-            excel_row += 1
-
-        # Section 4: VALID ACCOUNTS
-        if valid_rows:
-            excel_row = self._write_section_header(
-                sheet, excel_row,
-                f"VALID ACCOUNTS ({len(valid_rows)} records)",
-                col_count
-            )
-
-            for data_row, audit_result in valid_rows:
-                enhanced_row = list(data_row) + [""]
-
-                for col_idx, value in enumerate(enhanced_row, start=1):
-                    sheet.cell(row=excel_row, column=col_idx, value=value)
-
-                excel_row += 1
-
-        # Auto-adjust column widths
-        self._auto_adjust_column_widths(sheet)
-
-    def _write_grouped_type_sheet(
-        self,
-        sheet,
-        header_row: List[str],
-        results: Dict[str, Any],
-        column_indices: List[int],
-        bp_config: Dict[str, Any]
-    ):
-        """Write a sheet for a grouped member type with Net Balance column"""
-
-        # Add Net Balance and Notes columns to header
-        enhanced_header = header_row + ["Net Balance", "Notes"]
-        col_count = len(enhanced_header)
-
-        # Write header row
-        for col_idx, header_text in enumerate(enhanced_header, start=1):
-            cell = sheet.cell(row=1, column=col_idx, value=header_text)
-            cell.font = self.BOLD_FONT
-            cell.fill = self.HEADER_FILL
-            cell.alignment = self.CENTER_ALIGN
-
-        member_results = results.get('member_results', {})
-
-        # Get code column index for XX detection
-        code_col_idx = column_indices[0] if column_indices else 11
-
-        # Categorize members into flagged, XX, BP, and valid
-        flagged_members, xx_members, bp_members, valid_members = self._categorize_members(
-            member_results, column_indices, bp_config, code_col_idx
-        )
-
-        excel_row = 2
-
-        # Section 1: FLAGGED ACCOUNTS
-        if flagged_members:
-            total_flagged_rows = sum(len(m['transactions']) for m in flagged_members)
-            excel_row = self._write_section_header(
-                sheet, excel_row,
-                f"FLAGGED ACCOUNTS ({len(flagged_members)} members, {total_flagged_rows} records)",
-                col_count
-            )
-
-            for member_result in flagged_members:
-                flags = member_result.get('flags', [])
-                notes = " | ".join([str(flag) for flag in flags]) if flags else ""
-                net_balance = member_result.get('net_balance', 0.0)
-
-                for txn in member_result['transactions']:
-                    enhanced_row = list(txn) + [f"${net_balance:.2f}", notes]
-                    for col_idx, value in enumerate(enhanced_row, start=1):
-                        cell = sheet.cell(row=excel_row, column=col_idx, value=value)
-                        cell.fill = self.HIGHLIGHT_FILL
-                    excel_row += 1
-
-                self._apply_member_separator(sheet, excel_row - 1, col_count)
-
-            excel_row += 1
-
-        # Section 2: XX CODE ACCOUNTS
-        if xx_members:
-            total_xx_rows = sum(len(m['transactions']) for m in xx_members)
-            excel_row = self._write_section_header(
-                sheet, excel_row,
-                f"XX CODE ACCOUNTS ({len(xx_members)} members, {total_xx_rows} records)",
-                col_count
-            )
-
-            for member_result in xx_members:
-                flags = member_result.get('flags', [])
-                notes = " | ".join([str(flag) for flag in flags]) if flags else ""
-                net_balance = member_result.get('net_balance', 0.0)
-
-                for txn in member_result['transactions']:
-                    enhanced_row = list(txn) + [f"${net_balance:.2f}", notes]
-                    for col_idx, value in enumerate(enhanced_row, start=1):
-                        cell = sheet.cell(row=excel_row, column=col_idx, value=value)
-                        cell.fill = self.XX_FILL
-                    excel_row += 1
-
-                self._apply_member_separator(sheet, excel_row - 1, col_count)
-
-            excel_row += 1
-
-        # Section 3: BILLING PROBLEM ACCOUNTS
-        if bp_members:
-            total_bp_rows = sum(len(m['transactions']) for m in bp_members)
-            excel_row = self._write_section_header(
-                sheet, excel_row,
-                f"BILLING PROBLEM ACCOUNTS ({len(bp_members)} members, {total_bp_rows} records)",
-                col_count
-            )
-
-            for member_result in bp_members:
-                flags = member_result.get('flags', [])
-                notes = " | ".join([str(flag) for flag in flags]) if flags else ""
-                net_balance = member_result.get('net_balance', 0.0)
-
-                for txn in member_result['transactions']:
-                    enhanced_row = list(txn) + [f"${net_balance:.2f}", notes]
-                    for col_idx, value in enumerate(enhanced_row, start=1):
-                        cell = sheet.cell(row=excel_row, column=col_idx, value=value)
-                        cell.fill = self.BP_FILL
-                    excel_row += 1
-
-                self._apply_member_separator(sheet, excel_row - 1, col_count)
-
-            excel_row += 1
-
-        # Section 4: VALID ACCOUNTS
-        if valid_members:
-            total_valid_rows = sum(len(m['transactions']) for m in valid_members)
-            excel_row = self._write_section_header(
-                sheet, excel_row,
-                f"VALID ACCOUNTS ({len(valid_members)} members, {total_valid_rows} records)",
-                col_count
-            )
-
-            for member_result in valid_members:
-                net_balance = member_result.get('net_balance', 0.0)
-
-                for txn in member_result['transactions']:
-                    enhanced_row = list(txn) + [f"${net_balance:.2f}", ""]
-                    for col_idx, value in enumerate(enhanced_row, start=1):
-                        sheet.cell(row=excel_row, column=col_idx, value=value)
-                    excel_row += 1
-
-                self._apply_member_separator(sheet, excel_row - 1, col_count)
-
-        # Auto-adjust column widths
-        self._auto_adjust_column_widths(sheet)
-
-    def _write_mtm_type_sheet(
-        self,
-        sheet,
-        header_row: List[str],
-        results: Dict[str, Any],
-        column_indices: List[int],
-        bp_config: Dict[str, Any]
-    ):
-        """Write a sheet for MTM member type (member-based grouping)"""
-
-        # Create member-level header (same as main MTM report)
-        member_header = [
-            "First Name", "Last Name", "Member #", "Join Date",
-            "Member Type", "Enrollment Fee", "Initial Payment", "Coverage Start",
-            "Months Paid", "Missing Months", "Annual Fee", "Unmatched Charges", "Notes"
-        ]
-        col_count = len(member_header)
-
-        # Write header row
-        for col_idx, header_text in enumerate(member_header, start=1):
-            cell = sheet.cell(row=1, column=col_idx, value=header_text)
-            cell.font = self.BOLD_FONT
-            cell.fill = self.HEADER_FILL
-            cell.alignment = self.CENTER_ALIGN
-
-        member_results = results.get('member_results', {})
-
-        # Get code column index for XX detection
-        code_col_idx = column_indices[0] if column_indices else 11
-
-        # Categorize members
-        flagged_members, xx_members, bp_members, valid_members = self._categorize_members(
-            member_results, column_indices, bp_config, code_col_idx
-        )
-
-        excel_row = 2
-
-        # Section 1: FLAGGED MEMBERS
-        if flagged_members:
-            excel_row = self._write_section_header(
-                sheet, excel_row,
-                f"FLAGGED MEMBERS ({len(flagged_members)} members)",
-                col_count
-            )
-
-            for member_result in flagged_members:
-                excel_row = self._write_mtm_member_row(sheet, excel_row, member_result, self.HIGHLIGHT_FILL)
-                self._apply_member_separator(sheet, excel_row - 1, col_count)
-
-            excel_row += 1
-
-        # Section 2: XX CODE MEMBERS
-        if xx_members:
-            excel_row = self._write_section_header(
-                sheet, excel_row,
-                f"XX CODE MEMBERS ({len(xx_members)} members)",
-                col_count
-            )
-
-            for member_result in xx_members:
-                excel_row = self._write_mtm_member_row(sheet, excel_row, member_result, self.XX_FILL)
-                self._apply_member_separator(sheet, excel_row - 1, col_count)
-
-            excel_row += 1
-
-        # Section 3: BILLING PROBLEM MEMBERS
-        if bp_members:
-            excel_row = self._write_section_header(
-                sheet, excel_row,
-                f"BILLING PROBLEM MEMBERS ({len(bp_members)} members)",
-                col_count
-            )
-
-            for member_result in bp_members:
-                excel_row = self._write_mtm_member_row(sheet, excel_row, member_result, self.BP_FILL)
-                self._apply_member_separator(sheet, excel_row - 1, col_count)
-
-            excel_row += 1
-
-        # Section 4: VALID MEMBERS
-        if valid_members:
-            excel_row = self._write_section_header(
-                sheet, excel_row,
-                f"VALID MEMBERS ({len(valid_members)} members)",
-                col_count
-            )
-
-            for member_result in valid_members:
-                excel_row = self._write_mtm_member_row(sheet, excel_row, member_result, None)
-                self._apply_member_separator(sheet, excel_row - 1, col_count)
-
-        # Auto-adjust column widths
-        self._auto_adjust_column_widths(sheet)
-
     def _build_mtm_row_data(self, result: Dict[str, Any]) -> list:
         """Build row data for MTM member with all new fields."""
         # Format dates
@@ -1757,334 +1244,6 @@ class AuditReportGenerator:
             unmatched_str,
             notes
         ]
-
-    def _write_mtm_member_row(self, sheet, row_num: int, member_result: Dict[str, Any], fill) -> int:
-        """Write a single MTM member row and return next row number"""
-        row_data = self._build_mtm_row_data(member_result)
-
-        for col_idx, value in enumerate(row_data, start=1):
-            cell = sheet.cell(row=row_num, column=col_idx, value=value)
-            if fill:
-                cell.fill = fill
-
-        return row_num + 1
-
-    def create_individual_type_files(
-        self,
-        header_row: List[str],
-        type_results: Dict[str, Any],
-        base_filename: str,
-        member_type_mapping: Dict[str, str],
-        column_mapping: Dict[str, int] = None,
-        bp_config: Dict[str, Any] = None
-    ) -> Dict[str, Dict[str, str]]:
-        """
-        Create separate Excel files for each member_type.
-
-        For known types (1MCORE, 1YRCORE, 3MCORE, MTMCORE):
-            - Audited file with Notes column, organized as:
-              Flagged (yellow) → Valid → BP (orange at bottom)
-            - Raw file without Notes (for re-verification)
-        For unknown types: Raw data only (original columns, no Notes)
-
-        Args:
-            header_row: Column headers from original file
-            type_results: Dictionary with results per member_type
-            base_filename: Base name for output files (without extension)
-            member_type_mapping: Mapping of member_type codes to config keys
-            column_mapping: Dictionary with column name to index mappings
-            bp_config: BP detection configuration
-
-        Returns:
-            Dict mapping member_type to dict with 'audited' and/or 'raw' file paths
-        """
-        individual_files = {}
-
-        # Get column indices for BP detection
-        column_indices = []
-        if column_mapping:
-            bp_columns = bp_config.get('columns', ['code', 'member_type', 'member_group']) if bp_config else ['code', 'member_type', 'member_group']
-            for col_name in bp_columns:
-                idx = column_mapping.get(col_name)
-                if idx is not None and idx >= 0:
-                    column_indices.append(idx)
-        if not column_indices:
-            column_indices = [11, 9, 10]  # code, member_type, member_group in new format
-
-        for member_type, results in type_results.items():
-            is_known_type = results.get('has_rules', False)
-            rows = results.get('rows', [])
-
-            if not rows:
-                continue
-
-            # Sanitize member_type for filename
-            safe_type = member_type.replace('/', '-').replace('\\', '-').replace('*', '').replace('?', '').replace('[', '').replace(']', '')
-
-            individual_files[member_type] = {}
-
-            if is_known_type:
-                # Known type: generate BOTH audited file (with Notes) AND raw file (for re-upload)
-                is_grouped = results.get('is_grouped', False)
-
-                # 1. Create audited file with grouped or row-based format
-                wb_audited = Workbook()
-                sheet_audited = wb_audited.active
-                sheet_audited.title = "Data"
-
-                if is_grouped and results.get('member_results'):
-                    # Grouped format: Net Balance + Notes columns
-                    enhanced_header = header_row + ["Net Balance", "Notes"]
-                    col_count = len(enhanced_header)
-
-                    for col_idx, header_text in enumerate(enhanced_header, start=1):
-                        cell = sheet_audited.cell(row=1, column=col_idx, value=header_text)
-                        cell.font = self.BOLD_FONT
-                        cell.fill = self.HEADER_FILL
-                        cell.alignment = self.CENTER_ALIGN
-
-                    member_results = results.get('member_results', {})
-
-                    # Get code column index for XX detection
-                    code_col_idx = column_indices[0] if column_indices else 11
-
-                    # Categorize members
-                    flagged_members, xx_members_list, bp_members_list, valid_members_list = self._categorize_members(
-                        member_results, column_indices, bp_config, code_col_idx
-                    )
-
-                    excel_row = 2
-
-                    # Section 1: FLAGGED ACCOUNTS (yellow)
-                    if flagged_members:
-                        total_flagged_rows = sum(len(m['transactions']) for m in flagged_members)
-                        excel_row = self._write_section_header(
-                            sheet_audited, excel_row,
-                            f"FLAGGED ACCOUNTS ({len(flagged_members)} members, {total_flagged_rows} records)",
-                            col_count
-                        )
-                        for member_result in flagged_members:
-                            flags = member_result.get('flags', [])
-                            notes = " | ".join([str(flag) for flag in flags]) if flags else ""
-                            net_balance = member_result.get('net_balance', 0.0)
-                            for txn in member_result['transactions']:
-                                enhanced_row = list(txn) + [f"${net_balance:.2f}", notes]
-                                for col_idx, value in enumerate(enhanced_row, start=1):
-                                    cell = sheet_audited.cell(row=excel_row, column=col_idx, value=value)
-                                    cell.fill = self.HIGHLIGHT_FILL
-                                excel_row += 1
-                            self._apply_member_separator(sheet_audited, excel_row - 1, col_count)
-                        excel_row += 1
-
-                    # Section 2: XX CODE ACCOUNTS (light blue)
-                    if xx_members_list:
-                        total_xx_rows = sum(len(m['transactions']) for m in xx_members_list)
-                        excel_row = self._write_section_header(
-                            sheet_audited, excel_row,
-                            f"XX CODE ACCOUNTS ({len(xx_members_list)} members, {total_xx_rows} records)",
-                            col_count
-                        )
-                        for member_result in xx_members_list:
-                            flags = member_result.get('flags', [])
-                            notes = " | ".join([str(flag) for flag in flags]) if flags else ""
-                            net_balance = member_result.get('net_balance', 0.0)
-                            for txn in member_result['transactions']:
-                                enhanced_row = list(txn) + [f"${net_balance:.2f}", notes]
-                                for col_idx, value in enumerate(enhanced_row, start=1):
-                                    cell = sheet_audited.cell(row=excel_row, column=col_idx, value=value)
-                                    cell.fill = self.XX_FILL
-                                excel_row += 1
-                            self._apply_member_separator(sheet_audited, excel_row - 1, col_count)
-                        excel_row += 1
-
-                    # Section 3: VALID ACCOUNTS (no highlight)
-                    if valid_members_list:
-                        total_valid_rows = sum(len(m['transactions']) for m in valid_members_list)
-                        excel_row = self._write_section_header(
-                            sheet_audited, excel_row,
-                            f"VALID ACCOUNTS ({len(valid_members_list)} members, {total_valid_rows} records)",
-                            col_count
-                        )
-                        for member_result in valid_members_list:
-                            net_balance = member_result.get('net_balance', 0.0)
-                            for txn in member_result['transactions']:
-                                enhanced_row = list(txn) + [f"${net_balance:.2f}", ""]
-                                for col_idx, value in enumerate(enhanced_row, start=1):
-                                    sheet_audited.cell(row=excel_row, column=col_idx, value=value)
-                                excel_row += 1
-                            self._apply_member_separator(sheet_audited, excel_row - 1, col_count)
-                        excel_row += 1
-
-                    # Section 4: BILLING PROBLEM ACCOUNTS (orange at bottom)
-                    if bp_members_list:
-                        total_bp_rows = sum(len(m['transactions']) for m in bp_members_list)
-                        excel_row = self._write_section_header(
-                            sheet_audited, excel_row,
-                            f"BILLING PROBLEM ACCOUNTS ({len(bp_members_list)} members, {total_bp_rows} records)",
-                            col_count
-                        )
-                        for member_result in bp_members_list:
-                            flags = member_result.get('flags', [])
-                            notes = " | ".join([str(flag) for flag in flags]) if flags else ""
-                            net_balance = member_result.get('net_balance', 0.0)
-                            for txn in member_result['transactions']:
-                                enhanced_row = list(txn) + [f"${net_balance:.2f}", notes]
-                                for col_idx, value in enumerate(enhanced_row, start=1):
-                                    cell = sheet_audited.cell(row=excel_row, column=col_idx, value=value)
-                                    cell.fill = self.BP_FILL
-                                excel_row += 1
-                            self._apply_member_separator(sheet_audited, excel_row - 1, col_count)
-
-                else:
-                    # Non-grouped format: Notes column only
-                    enhanced_header = header_row + ["Notes"]
-                    col_count = len(enhanced_header)
-
-                    for col_idx, header_text in enumerate(enhanced_header, start=1):
-                        cell = sheet_audited.cell(row=1, column=col_idx, value=header_text)
-                        cell.font = self.BOLD_FONT
-                        cell.fill = self.HEADER_FILL
-                        cell.alignment = self.CENTER_ALIGN
-
-                    audit_results = results.get('audit_results', [])
-                    if audit_results and len(audit_results) > 0:
-                        data_pairs = list(zip(rows, audit_results))
-                    else:
-                        data_pairs = [(row, {'red_flags': [], 'has_flags': False}) for row in rows]
-
-                    code_col_idx = column_indices[0] if column_indices else 11
-
-                    flagged_rows, xx_rows, bp_rows, valid_rows = self._categorize_rows(
-                        [pair[0] for pair in data_pairs],
-                        [pair[1] for pair in data_pairs],
-                        column_indices,
-                        bp_config,
-                        code_col_idx
-                    )
-
-                    excel_row = 2
-
-                    if flagged_rows:
-                        excel_row = self._write_section_header(
-                            sheet_audited, excel_row,
-                            f"FLAGGED ACCOUNTS ({len(flagged_rows)} records)",
-                            col_count
-                        )
-                        for data_row, audit_result in flagged_rows:
-                            red_flags = audit_result.get('red_flags', [])
-                            notes = " | ".join([str(flag) for flag in red_flags]) if red_flags else ""
-                            enhanced_row = list(data_row) + [notes]
-                            for col_idx, value in enumerate(enhanced_row, start=1):
-                                cell = sheet_audited.cell(row=excel_row, column=col_idx, value=value)
-                                cell.fill = self.HIGHLIGHT_FILL
-                            excel_row += 1
-                        excel_row += 1
-
-                    if xx_rows:
-                        excel_row = self._write_section_header(
-                            sheet_audited, excel_row,
-                            f"XX CODE ACCOUNTS ({len(xx_rows)} records)",
-                            col_count
-                        )
-                        for data_row, audit_result in xx_rows:
-                            red_flags = audit_result.get('red_flags', [])
-                            notes = " | ".join([str(flag) for flag in red_flags]) if red_flags else ""
-                            enhanced_row = list(data_row) + [notes]
-                            for col_idx, value in enumerate(enhanced_row, start=1):
-                                cell = sheet_audited.cell(row=excel_row, column=col_idx, value=value)
-                                cell.fill = self.XX_FILL
-                            excel_row += 1
-                        excel_row += 1
-
-                    if valid_rows:
-                        excel_row = self._write_section_header(
-                            sheet_audited, excel_row,
-                            f"VALID ACCOUNTS ({len(valid_rows)} records)",
-                            col_count
-                        )
-                        for data_row, audit_result in valid_rows:
-                            enhanced_row = list(data_row) + [""]
-                            for col_idx, value in enumerate(enhanced_row, start=1):
-                                sheet_audited.cell(row=excel_row, column=col_idx, value=value)
-                            excel_row += 1
-                        excel_row += 1
-
-                    if bp_rows:
-                        excel_row = self._write_section_header(
-                            sheet_audited, excel_row,
-                            f"BILLING PROBLEM ACCOUNTS ({len(bp_rows)} records)",
-                            col_count
-                        )
-                        for data_row, audit_result in bp_rows:
-                            red_flags = audit_result.get('red_flags', [])
-                            notes = " | ".join([str(flag) for flag in red_flags]) if red_flags else ""
-                            enhanced_row = list(data_row) + [notes]
-                            for col_idx, value in enumerate(enhanced_row, start=1):
-                                cell = sheet_audited.cell(row=excel_row, column=col_idx, value=value)
-                                cell.fill = self.BP_FILL
-                            excel_row += 1
-
-                self._auto_adjust_column_widths(sheet_audited)
-
-                audited_filename = f"{base_filename}_{safe_type}.xlsx"
-                audited_path = self.output_folder / audited_filename
-                wb_audited.save(audited_path)
-                individual_files[member_type]['audited'] = str(audited_path)
-
-                # 2. Create raw file without Notes (for re-verification)
-                wb_raw = Workbook()
-                sheet_raw = wb_raw.active
-                sheet_raw.title = "Data"
-
-                # Write header row (no Notes)
-                for col_idx, header_text in enumerate(header_row, start=1):
-                    cell = sheet_raw.cell(row=1, column=col_idx, value=header_text)
-                    cell.font = self.BOLD_FONT
-                    cell.fill = self.HEADER_FILL
-                    cell.alignment = self.CENTER_ALIGN
-
-                # Write data rows
-                excel_row = 2
-                for row in rows:
-                    for col_idx, value in enumerate(row, start=1):
-                        sheet_raw.cell(row=excel_row, column=col_idx, value=value)
-                    excel_row += 1
-
-                self._auto_adjust_column_widths(sheet_raw)
-
-                raw_filename = f"{base_filename}_{safe_type}_raw.xlsx"
-                raw_path = self.output_folder / raw_filename
-                wb_raw.save(raw_path)
-                individual_files[member_type]['raw'] = str(raw_path)
-
-            else:
-                # Unknown type: raw data only, no Notes column
-                wb = Workbook()
-                sheet = wb.active
-                sheet.title = "Data"
-
-                # Write header row
-                for col_idx, header_text in enumerate(header_row, start=1):
-                    cell = sheet.cell(row=1, column=col_idx, value=header_text)
-                    cell.font = self.BOLD_FONT
-                    cell.fill = self.HEADER_FILL
-                    cell.alignment = self.CENTER_ALIGN
-
-                # Write data rows
-                excel_row = 2
-                for row in rows:
-                    for col_idx, value in enumerate(row, start=1):
-                        sheet.cell(row=excel_row, column=col_idx, value=value)
-                    excel_row += 1
-
-                self._auto_adjust_column_widths(sheet)
-
-                output_filename = f"{base_filename}_{safe_type}.xlsx"
-                output_path = self.output_folder / output_filename
-                wb.save(output_path)
-                individual_files[member_type]['raw'] = str(output_path)
-
-        return individual_files
 
     def create_split_type_files(
         self,

@@ -159,6 +159,7 @@ class RedFlagChecker:
             '%m/%d/%Y',  # 1/15/2025 (4-digit year)
             '%m/%d/%y',  # 1/15/25 (2-digit year)
             '%Y-%m-%d',  # 2025-01-15 (ISO format)
+            '%Y/%m/%d',  # 2025/12/30 (year first with slashes)
         ]
         for fmt in formats:
             try:

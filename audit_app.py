@@ -311,7 +311,7 @@ def main():
                 process_button = st.button(
                     "🚀 Process Files",
                     type="primary",
-                    use_container_width=True
+                    width='stretch'
                 )
 
             if process_button:
@@ -495,7 +495,7 @@ def main():
 
                         if type_data:
                             df = pd.DataFrame(type_data)
-                            st.dataframe(df, use_container_width=True, hide_index=True)
+                            st.dataframe(df, width='stretch', hide_index=True)
 
                         # Total and verification
                         if verification_passed:
@@ -536,7 +536,7 @@ def main():
                                                 file_name=file_path.name,
                                                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                                 key=f"split_{file_result['filename']}_{member_type}",
-                                                use_container_width=True
+                                                width='stretch'
                                             )
 
                             # Download All as ZIP button
@@ -556,7 +556,7 @@ def main():
                                 file_name=f"{base_name}_all_split_files.zip",
                                 mime="application/zip",
                                 key=f"zip_all_{file_result['filename']}",
-                                use_container_width=True
+                                width='stretch'
                             )
                     else:
                         st.error(f"❌ {file_result['filename']}: {file_result.get('error', 'Unknown error')}")
@@ -776,7 +776,7 @@ def main():
                                         data=f,
                                         file_name=report_path.name,
                                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                        use_container_width=True
+                                        width='stretch'
                                     )
 
             # Consolidated report download
@@ -793,7 +793,7 @@ def main():
                             file_name=consolidated_path.name,
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             type="primary",
-                            use_container_width=True
+                            width='stretch'
                         )
 
         else:
@@ -823,7 +823,10 @@ def main():
             all_audit_results = []
             for file_result in results['file_results']:
                 if file_result['success']:
-                    all_audit_results.extend(file_result['audit_results'])
+                    # Use .get() to safely handle different result structures
+                    audit_results = file_result.get('audit_results', [])
+                    if audit_results:
+                        all_audit_results.extend(audit_results)
 
             if all_audit_results:
                 # Create statistics object
@@ -851,7 +854,7 @@ def main():
                         color_continuous_scale="Reds"
                     )
                     fig.update_layout(height=400, showlegend=False)
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width='stretch')
 
                 st.markdown("---")
 
@@ -861,7 +864,7 @@ def main():
 
                 if combinations:
                     df_combos = pd.DataFrame(combinations, columns=["Combination", "Count"])
-                    st.dataframe(df_combos, use_container_width=True)
+                    st.dataframe(df_combos, width='stretch')
                 else:
                     st.info("No accounts with multiple red flags")
 
@@ -903,7 +906,7 @@ def main():
                         yaxis_title="Count",
                         height=400
                     )
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width='stretch')
 
                 st.markdown("---")
 
@@ -923,7 +926,7 @@ def main():
                         for rep, data in sorted(rep_stats.items(), key=lambda x: x[1]['flag_percentage'], reverse=True)
                     ])
 
-                    st.dataframe(df_reps, use_container_width=True)
+                    st.dataframe(df_reps, width='stretch')
 
         else:
             st.info("📁 Upload and process files in the 'Upload & Audit' tab to see pattern analysis")
@@ -939,7 +942,10 @@ def main():
             all_audit_results = []
             for file_result in results['file_results']:
                 if file_result['success']:
-                    all_audit_results.extend(file_result['audit_results'])
+                    # Use .get() to safely handle different result structures
+                    audit_results = file_result.get('audit_results', [])
+                    if audit_results:
+                        all_audit_results.extend(audit_results)
 
             if all_audit_results:
                 stats = AuditStatistics(all_audit_results)
@@ -1004,7 +1010,7 @@ def main():
                             color_discrete_sequence=['#FF6B6B', '#4ECDC4']
                         )
                         fig.update_traces(textposition='inside', textinfo='percent+label')
-                        st.plotly_chart(fig, use_container_width=True)
+                        st.plotly_chart(fig, width='stretch')
 
                 with col2:
                     st.markdown("### **Breakdown Details**")
@@ -1039,7 +1045,7 @@ def main():
                         for acc in top_accounts
                     ])
 
-                    st.dataframe(df_top, use_container_width=True, hide_index=True)
+                    st.dataframe(df_top, width='stretch', hide_index=True)
 
                 st.markdown("---")
 
@@ -1058,7 +1064,7 @@ def main():
                     if data['total'] > 0
                 ])
 
-                st.dataframe(df_exp, use_container_width=True, hide_index=True)
+                st.dataframe(df_exp, width='stretch', hide_index=True)
 
         else:
             st.info("📁 Upload and process files in the 'Upload & Audit' tab to see financial summary")

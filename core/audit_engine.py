@@ -142,6 +142,11 @@ class AuditEngine:
             net_balance = 0.0
             low_amounts = []
 
+            # Helper to avoid duplicate flags (checks by description)
+            def add_flag_if_unique(flag):
+                if not any(str(f) == str(flag) for f in all_flags):
+                    all_flags.append(flag)
+
             # Check member name consistency across all transactions
             name_variants = set()
             for row in transactions:
@@ -151,7 +156,7 @@ class AuditEngine:
 
             name_mismatch = len(name_variants) > 1
             if name_mismatch:
-                all_flags.append(RedFlag(
+                add_flag_if_unique(RedFlag(
                     "member_name_mismatch",
                     f"Different names found for member {member_number}: {', '.join(sorted(name_variants))}",
                     list(name_variants)
@@ -180,7 +185,7 @@ class AuditEngine:
 
             # Flag if unpaid balance (charges exceed payments)
             if net_balance > 0.01:
-                all_flags.append(RedFlag(
+                add_flag_if_unique(RedFlag(
                     "unpaid_balance",
                     f"Net balance ${net_balance:.2f} - charge without matching payment",
                     net_balance
@@ -188,17 +193,17 @@ class AuditEngine:
 
             # Flag if overpayment (payments exceed charges)
             if net_balance < -0.01:
-                all_flags.append(RedFlag(
+                add_flag_if_unique(RedFlag(
                     "overpayment",
                     f"Net balance -${abs(net_balance):.2f} - payment exceeds charges",
                     net_balance
                 ))
 
-            # Flag low amounts
+            # Flag low amounts (de-duplicated)
             for low_amount in low_amounts:
                 abs_amt = abs(low_amount)
                 txn_type = "Charge" if low_amount > 0 else "Payment"
-                all_flags.append(RedFlag(
+                add_flag_if_unique(RedFlag(
                     "low_amount",
                     f"{txn_type} ${abs_amt:.2f} is less than {threshold_percent}% of expected ${expected_price:.2f} (min ${min_expected:.2f})",
                     low_amount
@@ -207,7 +212,8 @@ class AuditEngine:
             # Run basic date/expiration checks on first row
             basic_flags = self.checker.check_all(first_row)
             basic_flags = [f for f in basic_flags if f.flag_type != 'date_invalid' or self._parse_date(first_row[cols['join_date']]) is None]
-            all_flags.extend(basic_flags)
+            for flag in basic_flags:
+                add_flag_if_unique(flag)
 
             member_results[member_number] = {
                 'member_number': member_number,
@@ -430,9 +436,14 @@ class AuditEngine:
             self.checker = create_checker(self.membership_type, self.location, format_type=detected_format)
             self.format_type = detected_format
 
+        print(f"[AUDIT] Starting audit: {file_data['filename']}")
+        print(f"[AUDIT] Membership type: {self.membership_type} | Location: {self.location}")
+
         # Use grouped approach for new format, row-by-row for old format
         if detected_format == 'new':
-            return self._audit_file_grouped(file_data, generate_report)
+            result = self._audit_file_grouped(file_data, generate_report)
+            print(f"[AUDIT] Completed: {file_data['filename']} - {result.get('total_records', 0)} records, {result.get('flagged_count', 0)} flagged")
+            return result
 
         # Old format: row-by-row audit
         audit_results = self.audit_rows(file_data['data_rows'])
@@ -468,6 +479,8 @@ class AuditEngine:
                 column_mapping=column_mapping,
                 bp_config=self.bp_config
             )
+
+        print(f"[AUDIT] Completed: {file_data['filename']} - {total_records} records, {flagged_count} flagged")
 
         return {
             'success': True,
@@ -545,6 +558,7 @@ class AuditEngine:
             Dictionary with results for all files
         """
         all_results = []
+        print(f"[AUDIT] Processing {len(uploaded_files)} file(s)...")
 
         for uploaded_file in uploaded_files:
             result = self.audit_uploaded_file(uploaded_file, generate_report=generate_individual_reports)
@@ -567,6 +581,8 @@ class AuditEngine:
         total_records = sum(r.get('total_records', 0) for r in all_results if r['success'])
         total_flagged = sum(r.get('flagged_count', 0) for r in all_results if r['success'])
         total_financial_impact = sum(r.get('total_financial_impact', 0) for r in all_results if r['success'])
+
+        print(f"[AUDIT] Batch complete: {successful_files}/{total_files} files processed, {total_flagged} total flags")
 
         return {
             'total_files': total_files,
@@ -597,6 +613,7 @@ class AuditEngine:
             '%Y-%m-%d %H:%M:%S',   # 2025-01-15 00:00:00
             '%Y-%m-%d',            # 2025-01-15
             '%m/%d/%Y %H:%M:%S',   # 1/15/2025 00:00:00
+            '%Y/%m/%d',            # 2025/12/30 (year first with slashes)
         ]
 
         for fmt in date_formats:
@@ -809,137 +826,6 @@ class AuditEngine:
 
         return coverage_start
 
-    def audit_1mcore_transactions(
-        self,
-        data_rows: List[List[str]],
-        expected_price: float
-    ) -> Dict[str, Any]:
-        """
-        Audit 1-Month Paid in Full (1MCORE) transactions.
-
-        Groups transactions by member and checks:
-        1. Payment balance (charges vs payments)
-        2. Price match (each charge against expected price)
-
-        Args:
-            data_rows: List of transaction rows (new format)
-            expected_price: Expected price for 1MCORE at this location
-
-        Returns:
-            Dictionary with member-level audit results
-        """
-        from .red_flags import RedFlag
-
-        cols = self.checker.NEW_FORMAT_COLUMNS
-
-        # Group transactions by member_number
-        member_transactions = defaultdict(list)
-        for row in data_rows:
-            member_number = row[cols['member_number']].strip() if cols['member_number'] < len(row) else ''
-            if member_number:
-                member_transactions[member_number].append(row)
-
-        member_results = {}
-
-        for member_number, transactions in member_transactions.items():
-            first_row = transactions[0]
-
-            # Get member info
-            first_name = first_row[cols['first_name']] if cols['first_name'] < len(first_row) else ''
-            last_name = first_row[cols['last_name']] if cols['last_name'] < len(first_row) else ''
-
-            all_flags = []
-            total_amount = 0.0
-            price_mismatches = []
-            low_amounts = []
-
-            # Calculate 90% threshold for low amount detection
-            threshold_percent = 90
-            min_expected = expected_price * (threshold_percent / 100) if expected_price > 0 else 0
-
-            # Process each transaction
-            for row in transactions:
-                amount_str = row[cols['amount']] if cols['amount'] < len(row) else ''
-                amount = self._parse_currency(amount_str)
-
-                if amount is not None:
-                    total_amount += amount
-                    abs_amount = abs(amount)
-
-                    # Check if amount (charge or payment) is less than 90% of expected
-                    if expected_price > 0 and abs_amount < min_expected:
-                        low_amounts.append(amount)
-
-                    # Check for price mismatch on charges (positive amounts)
-                    if amount > 0 and expected_price > 0:
-                        # Allow small tolerance (e.g., $0.01 for rounding)
-                        if abs(amount - expected_price) > 0.01:
-                            price_mismatches.append(amount)
-
-            # Flag if unpaid balance (charges exceed payments)
-            if total_amount > 0.01:  # Small tolerance for floating point
-                all_flags.append(RedFlag(
-                    "unpaid_balance",
-                    f"Unpaid balance: ${total_amount:.2f} (charges exceed payments)",
-                    total_amount
-                ))
-
-            # Flag low amounts (less than 90% of expected price)
-            for low_amount in low_amounts:
-                abs_amt = abs(low_amount)
-                txn_type = "Charge" if low_amount > 0 else "Payment"
-                all_flags.append(RedFlag(
-                    "low_amount",
-                    f"{txn_type} ${abs_amt:.2f} is less than {threshold_percent}% of expected ${expected_price:.2f} (min ${min_expected:.2f})",
-                    low_amount
-                ))
-
-            # Run basic date/expiration checks on first row
-            basic_flags = self.checker.check_all(first_row)
-            # Filter out any existing date_invalid flags since we're handling dates better now
-            basic_flags = [f for f in basic_flags if f.flag_type != 'date_invalid' or self._parse_date(first_row[cols['join_date']]) is None]
-            all_flags.extend(basic_flags)
-
-            # Check member name consistency
-            name_variants = set()
-            for row in transactions:
-                fn = row[cols['first_name']].strip() if cols['first_name'] < len(row) else ''
-                ln = row[cols['last_name']].strip() if cols['last_name'] < len(row) else ''
-                name_variants.add(f"{fn} {ln}")
-
-            name_mismatch = len(name_variants) > 1
-            if name_mismatch:
-                all_flags.append(RedFlag(
-                    "member_name_mismatch",
-                    f"Different names found for member {member_number}: {', '.join(sorted(name_variants))}",
-                    list(name_variants)
-                ))
-
-            member_results[member_number] = {
-                'member_number': member_number,
-                'first_name': first_name,
-                'last_name': last_name,
-                'transactions': transactions,
-                'transaction_count': len(transactions),
-                'total_amount': total_amount,
-                'net_balance': total_amount,
-                'flags': all_flags,
-                'has_flags': len(all_flags) > 0,
-                'flag_count': len(all_flags),
-                'price_mismatches': price_mismatches,
-                'low_amounts': low_amounts,
-                'name_mismatch': name_mismatch,
-                'name_variants': list(name_variants),
-                'first_row': first_row  # Keep for report generation
-            }
-
-        return {
-            'member_results': member_results,
-            'total_members': len(member_results),
-            'flagged_members': sum(1 for r in member_results.values() if r['has_flags']),
-            'total_transactions': sum(len(r['transactions']) for r in member_results.values())
-        }
-
     def _check_basic_mtm_rules(self, row: List[str]) -> List:
         """
         Check basic Month-to-Month validation rules on a single row.
@@ -1111,12 +997,17 @@ class AuditEngine:
 
             all_flags = []
 
+            # Helper to avoid duplicate flags (checks by description)
+            def add_flag_if_unique(flag):
+                if not any(str(f) == str(flag) for f in all_flags):
+                    all_flags.append(flag)
+
             # --- Step 1: Check charge/payment pairs ---
             unmatched_charges = []
             if check_charge_payment:
                 unmatched_charges = self._check_mtm_charge_payment_pairs(transactions)
                 for unmatched in unmatched_charges:
-                    all_flags.append(RedFlag(
+                    add_flag_if_unique(RedFlag(
                         "needs_verification",
                         f"Charge ${unmatched['amount']:.2f} on {unmatched['date'].strftime('%m/%d/%y')} without matching payment",
                         unmatched['amount']
@@ -1135,7 +1026,7 @@ class AuditEngine:
             if check_enrollment:
                 # Only flag if join_date is on or after report_start AND no enrollment fee
                 if join_date >= report_start and not has_enrollment:
-                    all_flags.append(RedFlag(
+                    add_flag_if_unique(RedFlag(
                         "missing_enrollment_fee",
                         f"New member (joined {join_date.strftime('%m/%d/%y')}) without ${enrollment_fee:.2f} enrollment fee",
                         enrollment_fee
@@ -1190,7 +1081,7 @@ class AuditEngine:
                 for required_month in required_months:
                     if required_month not in payment_months:
                         missing_months.append(required_month)
-                        all_flags.append(RedFlag(
+                        add_flag_if_unique(RedFlag(
                             "missing_monthly_payment",
                             f"No qualifying payment (>= ${monthly_rate:.2f}) for {required_month}",
                             required_month
@@ -1205,7 +1096,7 @@ class AuditEngine:
                         break
 
                 if not has_annual_fee:
-                    all_flags.append(RedFlag(
+                    add_flag_if_unique(RedFlag(
                         "missing_annual_fee",
                         f"No annual fee transaction ({annual_fee_keyword}) found",
                         0
@@ -1220,7 +1111,7 @@ class AuditEngine:
 
             name_mismatch = len(name_variants) > 1
             if name_mismatch:
-                all_flags.append(RedFlag(
+                add_flag_if_unique(RedFlag(
                     "member_name_mismatch",
                     f"Different names found for member {member_number}: {', '.join(sorted(name_variants))}",
                     list(name_variants)
@@ -1234,13 +1125,13 @@ class AuditEngine:
                     net_balance += amount
 
             if net_balance > 0.01:
-                all_flags.append(RedFlag(
+                add_flag_if_unique(RedFlag(
                     "unpaid_balance",
                     f"Net balance ${net_balance:.2f} - charge without matching payment",
                     net_balance
                 ))
             elif net_balance < -0.01:
-                all_flags.append(RedFlag(
+                add_flag_if_unique(RedFlag(
                     "overpayment",
                     f"Net balance -${abs(net_balance):.2f} - payment exceeds charges",
                     net_balance
@@ -1248,7 +1139,8 @@ class AuditEngine:
 
             # --- Run basic validation rules (exp year, draft dates) ---
             basic_flags = self._check_basic_mtm_rules(first_row)
-            all_flags.extend(basic_flags)
+            for flag in basic_flags:
+                add_flag_if_unique(flag)
 
             # Build result
             member_results[member_key] = {
@@ -1392,6 +1284,9 @@ class AuditEngine:
         self.checker = create_checker(self.membership_type, self.location, format_type='new')
         self.format_type = 'new'
 
+        print(f"[AUDIT] Starting Month-to-Month audit: {file_data['filename']}")
+        print(f"[AUDIT] Location: {self.location}")
+
         # Run MTM transaction audit
         mtm_results = self.audit_month_to_month_transactions(file_data['data_rows'])
 
@@ -1412,6 +1307,8 @@ class AuditEngine:
                 bp_config=self.bp_config
             )
 
+        print(f"[AUDIT] Completed MTM audit: {mtm_results['total_members']} members, {mtm_results['flagged_members']} flagged")
+
         return {
             'success': True,
             'filename': file_data['filename'],
@@ -1421,259 +1318,6 @@ class AuditEngine:
             'total_transactions': mtm_results['total_transactions'],
             'member_results': mtm_results['member_results'],
             'report_path': report_path
-        }
-
-    def audit_all_membership_types_uploaded(self, uploaded_file, generate_report: bool = True) -> Dict[str, Any]:
-        """
-        Audit an uploaded file containing all membership types.
-        Groups data by member_type column, applies appropriate rules per type,
-        and generates a multi-tab Excel report.
-
-        Args:
-            uploaded_file: Streamlit UploadedFile object
-            generate_report: Whether to generate Excel report
-
-        Returns:
-            Dictionary with audit results grouped by member_type
-        """
-        try:
-            file_data = self.file_reader.read_and_validate_upload(uploaded_file)
-        except Exception as e:
-            return {
-                'success': False,
-                'error': str(e),
-                'filename': uploaded_file.name if hasattr(uploaded_file, 'name') else 'Unknown'
-            }
-
-        if not file_data['is_valid']:
-            return {
-                'success': False,
-                'error': file_data['error'],
-                'filename': file_data['filename']
-            }
-
-        # This requires new format (20-column) for member_type column
-        detected_format = file_data.get('format_type', 'old')
-        if detected_format != 'new':
-            return {
-                'success': False,
-                'error': "All membership types audit requires new format (20-column) data with member_type column",
-                'filename': file_data['filename']
-            }
-
-        # Load config for member_type mapping
-        config = load_config()
-        member_type_mapping = config.get('member_type_mapping', {
-            '1MCORE': '1_month_paid_in_full',
-            '1YRCORE': '1_year_paid_in_full',
-            '3MCORE': '3_months_paid_in_full',
-            'MTMCORE': 'month_to_month'
-        })
-
-        # Get member_type column index (index 9 in new format)
-        member_type_col = 9  # member_type column in new format
-
-        # Group rows by member_type
-        rows_by_type = defaultdict(list)
-        for row in file_data['data_rows']:
-            if len(row) > member_type_col:
-                member_type = row[member_type_col].strip().upper()
-                rows_by_type[member_type].append(row)
-            else:
-                rows_by_type['UNKNOWN'].append(row)
-
-        # Process each member_type group
-        type_results = {}
-        total_records = 0
-        total_flagged = 0
-        total_financial_impact = 0
-
-        for member_type, rows in rows_by_type.items():
-            config_key = member_type_mapping.get(member_type)
-
-            if config_key == '1_month_paid_in_full':
-                # 1MCORE - use transaction-based audit with payment balance check
-                type_checker = create_checker(config_key, self.location, format_type='new')
-                self.checker = type_checker
-                expected_price = type_checker.expected_dues
-
-                onemcore_results = self.audit_1mcore_transactions(rows, expected_price)
-
-                # Build audit_results from member_results for consistent reporting
-                audit_results = []
-                for member_data in onemcore_results['member_results'].values():
-                    # Create an audit result for each member (using first row as representative)
-                    first_row = member_data['first_row']
-                    red_flags = member_data['flags']
-
-                    result = {
-                        'row_data': first_row,
-                        'red_flags': red_flags,
-                        'has_flags': member_data['has_flags'],
-                        'flag_count': member_data['flag_count'],
-                        'membership_age': type_checker.calculate_membership_age(first_row),
-                        'is_expired': type_checker.is_membership_expired(first_row),
-                        'financial_impact': member_data['total_amount'] if member_data['total_amount'] > 0 else 0,
-                        'dues_impact': 0,
-                        'balance_impact': member_data['total_amount'] if member_data['total_amount'] > 0 else 0,
-                        'member_id': member_data['member_number'],
-                        'member_name': f"{member_data['first_name']} {member_data['last_name']}"
-                    }
-                    audit_results.append(result)
-
-                flagged_count = onemcore_results['flagged_members']
-                type_financial_impact = sum(r['financial_impact'] for r in audit_results)
-
-                type_results[member_type] = {
-                    'config_key': config_key,
-                    'is_known_type': True,
-                    'has_rules': True,
-                    'is_1mcore': True,
-                    'is_grouped': True,
-                    'total_records': len(rows),
-                    'total_members': onemcore_results['total_members'],
-                    'flagged_count': flagged_count,
-                    'flagged_percentage': (flagged_count / onemcore_results['total_members'] * 100) if onemcore_results['total_members'] > 0 else 0,
-                    'financial_impact': type_financial_impact,
-                    'audit_results': audit_results,
-                    'member_results': onemcore_results['member_results'],
-                    'rows': rows
-                }
-
-                total_records += len(rows)
-                total_flagged += flagged_count
-                total_financial_impact += type_financial_impact
-
-            elif config_key and config_key != 'month_to_month':
-                # Known non-MTM type (not 1MCORE) - use grouped member matching
-                type_checker = create_checker(config_key, self.location, format_type='new')
-                self.checker = type_checker
-                expected_price = type_checker.expected_dues
-
-                grouped_results = self.audit_pif_grouped(rows, expected_price)
-
-                # Build audit_results from member_results for consistent reporting
-                audit_results = []
-                for member_data in grouped_results['member_results'].values():
-                    first_row = member_data['first_row']
-                    red_flags = member_data['flags']
-
-                    result = {
-                        'row_data': first_row,
-                        'red_flags': red_flags,
-                        'has_flags': member_data['has_flags'],
-                        'flag_count': member_data['flag_count'],
-                        'membership_age': type_checker.calculate_membership_age(first_row),
-                        'is_expired': type_checker.is_membership_expired(first_row),
-                        'financial_impact': member_data['net_balance'] if member_data['net_balance'] > 0 else 0,
-                        'dues_impact': 0,
-                        'balance_impact': member_data['net_balance'] if member_data['net_balance'] > 0 else 0,
-                        'member_id': member_data['member_number'],
-                        'member_name': f"{member_data['first_name']} {member_data['last_name']}"
-                    }
-                    audit_results.append(result)
-
-                flagged_count = grouped_results['flagged_members']
-                type_financial_impact = sum(r['financial_impact'] for r in audit_results)
-
-                type_results[member_type] = {
-                    'config_key': config_key,
-                    'is_known_type': True,
-                    'has_rules': True,
-                    'is_grouped': True,
-                    'total_records': len(rows),
-                    'total_members': grouped_results['total_members'],
-                    'flagged_count': flagged_count,
-                    'flagged_percentage': (flagged_count / grouped_results['total_members'] * 100) if grouped_results['total_members'] > 0 else 0,
-                    'financial_impact': type_financial_impact,
-                    'audit_results': audit_results,
-                    'member_results': grouped_results['member_results'],
-                    'rows': rows
-                }
-
-                total_records += len(rows)
-                total_flagged += flagged_count
-                total_financial_impact += type_financial_impact
-
-            elif config_key == 'month_to_month':
-                # MTM type - use transaction-based MTM audit
-                mtm_checker = create_checker('month_to_month', self.location, format_type='new')
-                self.checker = mtm_checker
-                mtm_results = self.audit_month_to_month_transactions(rows)
-
-                type_results[member_type] = {
-                    'config_key': config_key,
-                    'is_known_type': True,
-                    'has_rules': True,
-                    'is_mtm': True,
-                    'total_records': len(rows),
-                    'total_members': mtm_results['total_members'],
-                    'flagged_members': mtm_results['flagged_members'],
-                    'total_transactions': mtm_results['total_transactions'],
-                    'member_results': mtm_results['member_results'],
-                    'rows': rows
-                }
-
-                total_records += len(rows)
-                total_flagged += mtm_results['flagged_members']
-
-            else:
-                # Unknown type - just group data without rules
-                type_results[member_type] = {
-                    'config_key': None,
-                    'is_known_type': False,
-                    'has_rules': False,
-                    'total_records': len(rows),
-                    'flagged_count': 0,
-                    'flagged_percentage': 0,
-                    'financial_impact': 0,
-                    'audit_results': [{'row_data': row, 'red_flags': [], 'has_flags': False} for row in rows],
-                    'rows': rows
-                }
-
-                total_records += len(rows)
-
-        # Get column mapping for BP detection
-        temp_checker = create_checker('1_year_paid_in_full', self.location, format_type='new')
-        column_mapping = temp_checker.get_bp_detection_columns()
-
-        # Generate report if requested
-        report_path = None
-        individual_file_paths = {}
-        if generate_report:
-            original_name = Path(file_data['filename']).stem
-            output_filename = f"{original_name}_All_Types_Audit_Report.xlsx"
-
-            report_path = self.report_generator.create_all_types_report(
-                header_row=file_data['header'],
-                type_results=type_results,
-                output_filename=output_filename,
-                column_mapping=column_mapping,
-                bp_config=self.bp_config,
-                member_type_mapping=member_type_mapping
-            )
-
-            # Generate individual files for each member_type
-            individual_file_paths = self.report_generator.create_individual_type_files(
-                header_row=file_data['header'],
-                type_results=type_results,
-                base_filename=original_name,
-                member_type_mapping=member_type_mapping,
-                column_mapping=column_mapping,
-                bp_config=self.bp_config
-            )
-
-        return {
-            'success': True,
-            'filename': file_data['filename'],
-            'format_type': detected_format,
-            'total_records': total_records,
-            'total_flagged': total_flagged,
-            'total_financial_impact': total_financial_impact,
-            'type_results': type_results,
-            'member_types_found': list(rows_by_type.keys()),
-            'report_path': report_path,
-            'individual_file_paths': individual_file_paths
         }
 
     def _clean_date_format(self, date_str: str) -> str:
@@ -1813,6 +1457,8 @@ class AuditEngine:
                 'filename': file_data['filename']
             }
 
+        print(f"[SPLIT] Starting split by membership type: {file_data['filename']}")
+
         # Column indices in new format
         MEMBER_TYPE_COL = 9        # member_type
         TRANSACTION_DATE_COL = 3   # transaction_date
@@ -1879,6 +1525,10 @@ class AuditEngine:
         type_counts = {}
         for member_type, rows in rows_by_type.items():
             type_counts[member_type] = len(rows)
+
+        print(f"[SPLIT] Completed: {original_row_count} rows split into {len(rows_by_type)} membership types")
+        for member_type, count in type_counts.items():
+            print(f"[SPLIT]   - {member_type}: {count} rows")
 
         return {
             'success': True,
